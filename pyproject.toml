@@ -1,0 +1,128 @@
+# pyproject.toml — OpenTranscode v4.5
+#
+# v4.5: master release consolidating the v4.4.4 large-file fix
+# (CRF-0 → CRF-16 pre-scale intermediate; new --inline-scale flag and
+# UI checkbox for skipping the intermediate entirely) with all prior
+# v4.4.x stability work. Targets the "every large file fails" symptom
+# that was caused by lossless intermediates exhausting the temp
+# partition and presenting as cryptic "ffmpeg error (rc=234)" messages.
+#
+# Publish with:
+#   python -m build
+#   twine upload dist/*
+#
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opentranscode"
+version = "4.5.0"
+description = "Open-source batch video transcoder wrapping av1an + ffmpeg with a PySide6 GUI"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-or-later" }
+authors = [
+    { name = "Jeremy Anderson", email = "dcos@dcos.net" },
+]
+maintainers = [
+    { name = "Jeremy Anderson", email = "dcos@dcos.net" },
+]
+keywords = [
+    "av1an",
+    "ffmpeg",
+    "av1",
+    "vp9",
+    "x265",
+    "hevc",
+    "video-transcoding",
+    "video-encoder",
+    "batch-encoder",
+    "pyside6",
+    "linux",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Topic :: Multimedia :: Video :: Non-Linear Editor",
+    "Typing :: Typed",
+]
+dependencies = [
+    "PySide6>=6.6.0",
+]
+
+[project.optional-dependencies]
+# Dev / test extras — install with: pip install -e ".[dev]"
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "build>=1.0",
+    "twine>=4.0",
+]
+
+[project.urls]
+Homepage = "https://git.dcos.net/dcosnet/OpenTranscode"
+Repository = "https://git.dcos.net/dcosnet/OpenTranscode"
+Documentation = "https://git.dcos.net/dcosnet/OpenTranscode/blob/main/README.md"
+"Bug Tracker" = "https://git.dcos.net/dcosnet/OpenTranscode/issues"
+"QA Report" = "https://git.dcos.net/dcosnet/OpenTranscode/blob/main/OpenTranscode_QA_Report.pdf"
+
+[project.scripts]
+# Console entry point — `opentranscode` command after `pip install opentranscode`
+opentranscode = "opentranscode.__main__:main"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Setuptools-specific config
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tool.setuptools]
+# We're a pure-Python package — no extension modules.
+zip-safe = false
+
+[tool.setuptools.packages.find]
+# Auto-discover packages under opentranscode/ and widgets/
+where = ["."]
+include = ["opentranscode*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+# Include the QSS theme + non-Python assets
+opentranscode = ["*.qss", "*.txt"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool config
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "e2e: marks tests as end-to-end (require real ffmpeg/av1an)",
+]
+
+[tool.coverage.run]
+source = ["opentranscode"]
+omit = [
+    "*/tests/*",
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
