@@ -97,13 +97,14 @@ import re
 import shutil
 import signal
 import subprocess
+import site
 import sys
 import tempfile
 import threading
 import time
 import ctypes
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, field
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -410,6 +411,25 @@ class VideoCodecProfile:
     # profile. Used by _output_already_encoded() to detect skip-existing.
     # av1 → "av1", vp9 → "vp9", hevc → "hevc".
     ffprobe_codec_name: str = ""
+    # v4.6.0: hardware (NVENC) counterpart for this codec family. Empty
+    # string = no hardware encoder exists for this family (VP9 has no
+    # NVENC encoder). The GPU path is ffmpeg-only (av1an cannot drive
+    # NVENC); EncoderWorker.resolve_gpu_encoder() only selects it when a
+    # functional probe proved the encoder works on this system. The
+    # ffprobe codec_name is IDENTICAL to the CPU encoder's (hevc_nvenc
+    # also produces "hevc"), so skip-existing detection works across
+    # GPU/CPU re-encodes of the same family.
+    gpu_encoder: str = ""
+    # (crf, preset) -> ffmpeg args for the NVENC encoder. Mirrors
+    # ffmpeg_vargs_fn. None when gpu_encoder is empty.
+    gpu_vargs_fn: Callable[[int, int], list[str]] | None = None
+    # v4.8.0: GPU-profile support. *gpu_family* is the codec family key
+    # used by GpuProfile.encoders ("av1"/"hevc"/"vp9"); *gpu_encoders_by_api*
+    # maps a hardware API (nvenc/vaapi/qsv) to this profile's ffmpeg
+    # encoder for that API. resolve_gpu_encoder() picks the entry matching
+    # the selected GPU profile.
+    gpu_family: str = ""
+    gpu_encoders_by_api: dict[str, str] = field(default_factory=dict)
 
 @dataclass
 class AudioProfile:
@@ -499,6 +519,52 @@ def _x265_ffmpeg_args(crf: int, preset: int) -> list[str]:
             "-pix_fmt", "yuv420p10le", "-g", "240"]
 
 
+# ── v4.6.0: NVENC (hardware) vargs ──
+# NVENC quality control: -rc vbr + -cq N + -b:v 0 is the constant-quality
+# mode that maps most closely to the CPU encoders' CRF (cq ≈ crf for HEVC
+# and AV1 within ~±3). -b:v 0 removes the default bitrate cap so -cq
+# actually governs quality. Presets are p1 (fastest) .. p7 (slowest/best)
+# on all current NVENC generations; the legacy "slow/medium/fast" aliases
+# are deprecated.
+#
+# Pixel format: 8-bit yuv420p. Pascal-generation cards (GTX 10xx) run
+# HEVC Main10 at roughly half throughput, and the archival targets here
+# are 8-bit phone/BluRay sources — 8-bit keeps the GPU path at full
+# speed. ffmpeg auto-converts 10-bit sources to yuv420p.
+
+def _nvenc_preset(preset: int) -> str:
+    """Map the CPU preset tiers (lower value = slower/better) to NVENC
+    p-presets. CPU preset values across profiles are 0..10 with 0/5 =
+    slowest quality tiers; NVENC is fast enough that even p7 outruns any
+    CPU encoder, so the whole range compresses to p3..p7."""
+    if preset <= 6:
+        return "p7"   # "Slow" tier → best NVENC quality
+    if preset <= 8:
+        return "p5"   # "Medium" tier
+    return "p4"       # "Fast"/"Faster" tiers
+
+
+def _hevc_nvenc_args(crf: int, preset: int) -> list[str]:
+    """FFmpeg args for hevc_nvenc (x265/HEVC family hardware encoder)."""
+    return ["-c:v", "hevc_nvenc", "-preset", _nvenc_preset(preset),
+            "-tune", "hq", "-rc", "vbr", "-cq", str(crf), "-b:v", "0",
+            "-pix_fmt", "yuv420p", "-g", "240"]
+
+
+def _h264_nvenc_args(crf: int, preset: int) -> list[str]:
+    """FFmpeg args for h264_nvenc (hardware H.264 — compatibility target)."""
+    return ["-c:v", "h264_nvenc", "-preset", _nvenc_preset(preset),
+            "-tune", "hq", "-rc", "vbr", "-cq", str(crf), "-b:v", "0",
+            "-pix_fmt", "yuv420p", "-g", "240"]
+
+
+def _av1_nvenc_args(crf: int, preset: int) -> list[str]:
+    """FFmpeg args for av1_nvenc (AV1 family hardware encoder, RTX 40+)."""
+    return ["-c:v", "av1_nvenc", "-preset", _nvenc_preset(preset),
+            "-tune", "hq", "-rc", "vbr", "-cq", str(crf), "-b:v", "0",
+            "-pix_fmt", "yuv420p", "-g", "240"]
+
+
 VIDEO_CODECS: list[VideoCodecProfile] = [
     VideoCodecProfile(
         label="AV1 (SVT-AV1)",
@@ -512,6 +578,14 @@ VIDEO_CODECS: list[VideoCodecProfile] = [
         presets=["Slow (8)", "Medium (6)", "Fast (4)", "Faster (2)"],
         preset_map={"Slow (8)": 8, "Medium (6)": 6, "Fast (4)": 4, "Faster (2)": 2},
         ffprobe_codec_name="av1",  # v4.3.0: skip-existing detection
+        # v4.6.0: av1_nvenc exists only on RTX 40+ (Ada) cards; on Pascal
+        # (GTX 10xx) the functional probe fails and auto falls back to
+        # the SVT-AV1 CPU encoder.
+        gpu_encoder="av1_nvenc",
+        gpu_vargs_fn=_av1_nvenc_args,
+        gpu_family="av1",
+        gpu_encoders_by_api={"nvenc": "av1_nvenc", "qsv": "av1_qsv",
+                             "vaapi": "av1_vaapi"},
     ),
     VideoCodecProfile(
         label="VP9",
@@ -525,6 +599,10 @@ VIDEO_CODECS: list[VideoCodecProfile] = [
         presets=["Slow (0)", "Medium (2)", "Fast (4)", "Faster (6)"],
         preset_map={"Slow (0)": 0, "Medium (2)": 2, "Fast (4)": 4, "Faster (6)": 6},
         ffprobe_codec_name="vp9",  # v4.3.0: skip-existing detection
+        # v4.8.0: VP9 has no NVENC encoder; VAAPI (AMD/older Intel) can
+        # encode it on some cards.
+        gpu_family="vp9",
+        gpu_encoders_by_api={"vaapi": "vp9_vaapi"},
     ),
     VideoCodecProfile(
         label="x265 (HEVC)",
@@ -538,6 +616,14 @@ VIDEO_CODECS: list[VideoCodecProfile] = [
         presets=["Slow (5)", "Medium (7)", "Fast (9)", "Faster (10)"],
         preset_map={"Slow (5)": 5, "Medium (7)": 7, "Fast (9)": 9, "Faster (10)": 10},
         ffprobe_codec_name="hevc",  # v4.3.0: skip-existing detection
+        # v4.6.0: hevc_nvenc works on every NVENC generation since Maxwell
+        # GM206 (incl. the GTX 1070) — this is the family that benefits
+        # most from GPU mode.
+        gpu_encoder="hevc_nvenc",
+        gpu_vargs_fn=_hevc_nvenc_args,
+        gpu_family="hevc",
+        gpu_encoders_by_api={"nvenc": "hevc_nvenc", "qsv": "hevc_qsv",
+                             "vaapi": "hevc_vaapi"},
     ),
 ]
 
@@ -596,6 +682,23 @@ FFMPEG_LIB_KEY_MAP: dict[str, str] = {
     "libaom-av1": "libaom",
     "libvpx-vp9": "libvpx",
     "libx265":    "libx265",
+    # v4.6.0: hardware encoders. These keys are populated by
+    # _probe_ffmpeg_libs() alongside the software encoders, and — unlike
+    # the compiled-in check — EncoderWorker additionally gates the GPU
+    # path on env.gpu.functional (a real encode smoke test), because a
+    # ffmpeg build can list an NVENC encoder that the installed driver
+    # cannot open (NVENC API version mismatch).
+    "hevc_nvenc": "hevc_nvenc",
+    "h264_nvenc": "h264_nvenc",
+    "av1_nvenc":  "av1_nvenc",
+    # v4.8.0: hardware APIs for AMD (VAAPI) and Intel (QSV) profiles.
+    "hevc_vaapi": "hevc_vaapi",
+    "h264_vaapi": "h264_vaapi",
+    "av1_vaapi":  "av1_vaapi",
+    "vp9_vaapi":  "vp9_vaapi",
+    "hevc_qsv":   "hevc_qsv",
+    "h264_qsv":   "h264_qsv",
+    "av1_qsv":    "av1_qsv",
 }
 
 
@@ -1327,6 +1430,140 @@ def detect_distro() -> DistroProfile:
 
 
 # ──────────────────────────────────────────────
+#  GPU PROBE (v4.6.0 — NVENC hardware encoding)
+# ──────────────────────────────────────────────
+
+# NVENC encoders we know how to drive, in preference order (best
+# compression efficiency first). av1_nvenc only exists on RTX 40+; the
+# functional smoke test below decides what is actually usable.
+_NVENC_ENCODER_NAMES: tuple[str, ...] = ("av1_nvenc", "hevc_nvenc", "h264_nvenc")
+
+
+@dataclass
+class GpuInfo:
+    """Result of the GPU/NVENC probe.
+
+    ``encoders``   — encoder name → ffmpeg was BUILT with it (from
+                     ``ffmpeg -encoders``).
+    ``functional`` — encoder name → a real 0.2s NVENC encode SUCCEEDED.
+                     This is the gate EncoderWorker uses: a ffmpeg build
+                     can list hevc_nvenc while the installed driver is
+                     too old for the NVENC API version it was compiled
+                     against ("Driver does not support the required
+                     nvenc API version") — only a live encode reveals
+                     that.
+    ``details``    — encoder name → first stderr line when the smoke
+                     test failed (actionable diagnostics).
+    """
+    name: str = ""                                            # GPU model name via nvidia-smi, "" if unknown
+    encoders: dict[str, bool] = field(default_factory=dict)
+    functional: dict[str, bool] = field(default_factory=dict)
+    details: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def usable_encoders(self) -> list[str]:
+        """Encoders that passed the live encode test, preference order."""
+        return [e for e in _NVENC_ENCODER_NAMES if self.functional.get(e, False)]
+
+    @property
+    def has_gpu(self) -> bool:
+        return bool(self.usable_encoders)
+
+    @property
+    def first_failure_detail(self) -> str:
+        """First non-empty failure detail (for user-facing warnings)."""
+        for e in _NVENC_ENCODER_NAMES:
+            d = self.details.get(e, "")
+            if d:
+                return d
+        return ""
+
+
+def _probe_gpu(ffmpeg_bin: str) -> GpuInfo:
+    """Detect NVIDIA NVENC hardware encoders and verify they actually work.
+
+    Two-stage probe:
+
+      1. Compiled-in check — grep ``ffmpeg -encoders`` for the NVENC
+         encoder names. Cheap; answers "could this ffmpeg ever do NVENC".
+      2. Functional smoke test — for each compiled-in encoder, encode a
+         0.2s 256x264 lavfi color source with ``-c:v <enc> -f null -``.
+         Catches the real-world failure modes the compiled-in check
+         cannot: NVIDIA driver too old for the ffmpeg build's NVENC API
+         version, no /dev/nvidia* access, driver loaded but GPU dead.
+
+    GPU model name is best-effort via nvidia-smi (display only).
+    """
+    info = GpuInfo()
+
+    if not ffmpeg_bin:
+        return info
+
+    # --- Stage 1: compiled-in encoders ---
+    try:
+        res = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        encoders_out = res.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        encoders_out = ""
+
+    for enc in _NVENC_ENCODER_NAMES:
+        info.encoders[enc] = f" {enc} " in encoders_out
+
+    compiled_in = [e for e in _NVENC_ENCODER_NAMES if info.encoders[e]]
+    if not compiled_in:
+        return info  # no hardware encoders in this build — skip stage 2
+
+    # --- GPU model name (display only, never gates anything) ---
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        try:
+            res = subprocess.run(
+                [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                info.name = res.stdout.strip().splitlines()[0].strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # --- Stage 2: functional smoke test per compiled-in encoder ---
+    for enc in compiled_in:
+        try:
+            res = subprocess.run(
+                [
+                    ffmpeg_bin, "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi",
+                    "-i", "color=c=black:s=256x256:d=0.2:r=24",
+                    "-frames:v", "5",
+                    "-c:v", enc, "-f", "null", "-",
+                ],
+                capture_output=True, text=True, timeout=20,
+            )
+            info.functional[enc] = res.returncode == 0
+            if res.returncode != 0:
+                # First stderr line with substance (nvenc errors are
+                # prefixed "hevc_nvenc @ 0x...]" — keep them readable).
+                for line in (res.stderr or "").splitlines():
+                    line = line.strip()
+                    if line:
+                        # Strip the "name @ 0xADDR]" prefix for brevity.
+                        line = re.sub(r"^\[[^]]+@\s*0x[0-9a-f]+\]\s*", "", line)
+                        info.details[enc] = line[:160]
+                        break
+        except subprocess.TimeoutExpired:
+            info.functional[enc] = False
+            info.details[enc] = f"{enc} smoke test timed out after 20s"
+        except (OSError, subprocess.SubprocessError) as e:
+            info.functional[enc] = False
+            info.details[enc] = str(e)[:160]
+
+    return info
+
+
+# ──────────────────────────────────────────────
 #  ENVIRONMENT PROBE (distro-aware, extended)
 # ──────────────────────────────────────────────
 
@@ -1353,6 +1590,9 @@ class EnvProbe:
     vs_version: str | None = None  # VapourSynth version string (for diagnostics)
     vs_script_lib: str | None = None  # path to libvapoursynth-script.so that passed
     cpu: CpuTopology = field(default_factory=lambda: CpuTopology(1, 1, 1, "Unknown"))
+    # v4.6.0: GPU/NVENC probe result. EncoderWorker reads
+    # env.gpu.functional[encoder_name] when the engine is auto/gpu.
+    gpu: GpuInfo = field(default_factory=GpuInfo)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -1442,6 +1682,11 @@ def _probe_ffmpeg_libs(ffmpeg_bin: str) -> dict[str, bool]:
         ("libopus",   ["libopus "]),
         ("libvorbis", ["libvorbis "]),
         ("flac",      ["flac "]),
+        # v4.6.0: NVENC hardware encoders (compiled-in check only — the
+        # live-encode gate is _probe_gpu()'s functional dict).
+        ("hevc_nvenc", ["hevc_nvenc "]),
+        ("h264_nvenc", ["h264_nvenc "]),
+        ("av1_nvenc",  ["av1_nvenc "]),
     ]
     libs = {}
     for lib_name, search_strings in checks:
@@ -1740,6 +1985,37 @@ def probe_environment() -> EnvProbe:
         if result.ffmpeg_version:
             result.warnings.append(f"FFmpeg version: {result.ffmpeg_version}")
         result.ffmpeg_libs = _probe_ffmpeg_libs(result.ffmpeg_path)
+        result.ffmpeg_libs = _probe_ffmpeg_libs(result.ffmpeg_path)
+
+        # v4.6.0: GPU/NVENC probe — compiled-in check + live encode smoke
+        # test. EncoderWorker gates the GPU path on env.gpu.functional;
+        # this warning block surfaces the result (and the fix when the
+        # driver is too old for the ffmpeg build's NVENC API).
+        result.gpu = _probe_gpu(result.ffmpeg_path)
+        gpu = result.gpu
+        if gpu.has_gpu:
+            result.warnings.append(
+                f"GPU: {gpu.name or 'NVIDIA'} — NVENC ready: "
+                f"{', '.join(gpu.usable_encoders)} (engine: Auto will use the GPU)"
+            )
+        elif gpu.encoders and any(gpu.encoders.values()):
+            present = [e for e in _NVENC_ENCODER_NAMES if gpu.encoders.get(e)]
+            detail = gpu.first_failure_detail
+            result.warnings.append(
+                f"GPU: NVENC encoder(s) {', '.join(present)} present in ffmpeg "
+                f"but NOT usable — {detail or 'smoke test failed'}. "
+                f"Auto engine will fall back to CPU."
+            )
+            if "API version" in detail or "minimum required Nvidia driver" in detail:
+                result.warnings.append(
+                    "  FIX: update the NVIDIA driver (the ffmpeg build's NVENC "
+                    "API is newer than the installed driver supports), or use "
+                    "an ffmpeg build matching the installed driver."
+                )
+        else:
+            result.warnings.append(
+                "GPU: no hardware encoder in this ffmpeg build — CPU encoding."
+            )
 
         # Warn about missing AUDIO libs (video codecs are handled by av1an's own
         # encoder binaries — ffmpeg's video encoder list is irrelevant)
@@ -1833,6 +2109,32 @@ def probe_environment() -> EnvProbe:
                     "chunk-parallel encoding."
                 )
                 result.av1an_flags["chunk_method_override"] = "select"
+                result.av1an_flags["chunk_method_override"] = "select"
+
+            # v4.6.0: ffmpeg ≥ 7 removed the -vsync option that av1an's
+            # segment/hybrid chunk extraction passes to ffmpeg. On those
+            # systems every segment-based chunk dies immediately with
+            # "Unrecognized option 'vsync'." — the y4m pipe breaks and
+            # each chunk fails 3x. The select override above already
+            # avoids those methods when no plugins are installed; this
+            # warning tells plugin-less users on new ffmpeg WHY av1an is
+            # stuck on slow select.
+            if not vs_plugins and result.ffmpeg_version:
+                try:
+                    ffmpeg_major = int(
+                        re.match(r"[nN]?(\d+)", result.ffmpeg_version).group(1)
+                    )
+                except (AttributeError, ValueError):
+                    ffmpeg_major = 0
+                if ffmpeg_major >= 7:
+                    result.warnings.append(
+                        "av1an note: ffmpeg ≥ 7 removed the -vsync option av1an's "
+                        "segment/hybrid chunk methods use — those methods fail "
+                        "with \"Unrecognized option 'vsync'\". Chunking stays on "
+                        "'select'. Install a VapourSynth source plugin "
+                        "(bestsource/ffms2/lsmash) to escape slow select, or use "
+                        "the default ffmpeg-only path."
+                    )
 
         except (OSError, subprocess.SubprocessError) as e:
             result.errors.append(f"av1an probe failed: {e}")
@@ -2042,12 +2344,29 @@ def _av1an_env() -> dict[str, str]:
     When VapourSynth is built from git and installed to ~/.local/, the linker
     won't find libvapoursynth-script.so unless LD_LIBRARY_PATH points there.
     This function ensures every av1an invocation inherits that path.
+
+    v4.7.1: the git VS stack is self-contained in the python user
+    site-packages (module + libs + BestSource plugin), so the runtime env
+    also gets that dir on LD_LIBRARY_PATH and the user site on PYTHONPATH —
+    otherwise av1an loads the system VS and never sees the fresh stack.
     """
     env = os.environ.copy()
     local_lib = str(Path.home() / ".local" / "lib")
     existing = env.get("LD_LIBRARY_PATH", "")
     if local_lib not in existing:
         env["LD_LIBRARY_PATH"] = f"{local_lib}:{existing}".rstrip(":")
+    try:
+        user_site = Path(site.getusersitepackages())
+        vs_dir = user_site / "vapoursynth"
+        if vs_dir.is_dir() and (vs_dir / "libvsscript.so").exists():
+            existing = env.get("LD_LIBRARY_PATH", "")
+            if str(vs_dir) not in existing:
+                env["LD_LIBRARY_PATH"] = f"{vs_dir}:{existing}".rstrip(":")
+            py_path = env.get("PYTHONPATH", "")
+            if str(user_site) not in py_path:
+                env["PYTHONPATH"] = f"{user_site}:{py_path}".rstrip(":")
+    except (AttributeError, OSError):
+        pass
     return env
 
 
@@ -2101,6 +2420,18 @@ def _probe_vs_source_plugins() -> list[str]:
     search_dirs.append(Path("/usr/lib/vapoursynth"))
     search_dirs.append(Path("/usr/local/lib/vapoursynth"))
     search_dirs.append(Path("/usr/lib/x86_64-linux-gnu/vapoursynth"))
+    # v4.7.1: the git-built VapourSynth stack installs its plugins into
+    # the python site-packages tree (module + libs + plugins/ are one
+    # self-contained unit). Probe those dirs too.
+    try:
+        search_dirs.append(Path(site.getusersitepackages()) / "vapoursynth" / "plugins")
+    except (AttributeError, OSError):
+        pass
+    try:
+        for d in site.getsitepackages():
+            search_dirs.append(Path(d) / "vapoursynth" / "plugins")
+    except (AttributeError, OSError):
+        pass
 
     found: set[str] = set()
     for d in search_dirs:
@@ -2294,18 +2625,27 @@ def _mkdir_private(path: Path) -> bool:
         return False
 
 
-def _worker_temp_dir(worker_pid: int) -> Path:
+def _worker_temp_dir(worker_pid: int, lane: str = "") -> Path:
     """Return a per-worker temp subdir named by PID.
 
     v3: each EncoderWorker gets its own subdir under the shared app temp
     dir, so the final cleanup sweep can safely nuke only this worker's
     intermediates without affecting a concurrent worker. The subdir is
     also created with mode=0o700 (FIO09-C).
+
+    v4.7.0: *lane* suffixes the dir ("gpu"/"cpu") for the hybrid
+    scheduler's concurrent lanes — both run in the SAME process, so the
+    PID alone no longer separates them, and a lane finishing early must
+    not sweep the other lane's intermediates out from under it.
     """
     base = _get_app_temp_dir()
-    sub = base / f"worker-{worker_pid}"
+    name = f"worker-{worker_pid}" + (f"-{lane}" if lane else "")
+    sub = base / name
     _mkdir_private(sub)
     return sub
+
+
+
 
 
 def _temp_path_for(file_path: Path, suffix: str = ".scaled_tmp.mkv",
@@ -2620,10 +2960,203 @@ def _compute_intelligent_worker_count_for(
 #  ENCODER WORKER (QThread, from PySide6 ver, extended)
 # ──────────────────────────────────────────────
 
+def scan_input_files(in_dir: Path, extensions: set[str]) -> list[Path]:
+    """Collect the transcodable files under *in_dir* (v4.7.0).
+
+    Used by ``EncoderWorker.run()`` for the default whole-directory scan
+    AND by the hybrid scheduler's pre-scan, which must partition the
+    queue BEFORE the per-lane workers are constructed. Excludes leftover
+    pre-scale intermediates from previous failed runs.
+    """
+    return sorted(
+        f for f in in_dir.rglob("*")
+        if f.is_file()
+        and f.suffix.lower() in extensions
+        and not f.name.endswith(".scaled_tmp.mkv")
+    )
+
+
+
+
+GPU_SPEED_RATIO_DEFAULT = 8
+
+# Threads held back from the CPU lane so the GPU lane's decode / scale /
+# mux processes stay responsive. The NVENC encode itself runs on the GPU
+# silicon; the CPU side of a nvenc job is light.
+HYBRID_CPU_RESERVE_THREADS = 2
+
+
+@dataclass
+class HybridPlan:
+    """Result of planning a hybrid (GPU + CPU) queue split."""
+
+    gpu_files: list[Path] = field(default_factory=list)
+    cpu_files: list[Path] = field(default_factory=list)
+    gpu_encoder: str = ""                 # e.g. "hevc_nvenc"
+    cpu_budget_threads: int = 1           # CPU lane thread budget (logical - reserve)
+    gpu_speed_ratio: int = GPU_SPEED_RATIO_DEFAULT
+
+    @property
+    def total_files(self) -> int:
+        return len(self.gpu_files) + len(self.cpu_files)
+
+
+def plan_hybrid(
+    files: list[Path],
+    gpu_encoder: str | None,
+    gpu_functional: bool,
+    logical_threads: int,
+    sizes: dict[Path, int] | None = None,
+    gpu_speed_ratio: int = GPU_SPEED_RATIO_DEFAULT,
+    cpu_reserve: int = HYBRID_CPU_RESERVE_THREADS,
+) -> HybridPlan | None:
+    """Split *files* between the GPU and CPU lanes, or return None when a
+    hybrid split cannot apply.
+
+    Returns None when:
+      - the codec family has no GPU encoder, or the live GPU probe failed
+        (caller should fall back to a plain CPU queue), or
+      - *files* is empty.
+
+    Assignment is LPT (longest-processing-time first): files are sorted
+    by size descending and each goes to the lane with the lower
+    estimated load, where the GPU lane's per-file cost is size /
+    gpu_speed_ratio. Both lanes then finish at roughly the same time.
+
+    *sizes* maps files to byte sizes; missing entries fall back to the
+    mean of the known sizes (or 10 MB when nothing is known) so a single
+    unreadable file cannot skew the whole split.
+    """
+    if not gpu_encoder or not gpu_functional or not files:
+        return None
+
+    sizes = sizes or {}
+    known = [s for s in sizes.values() if s]
+    avg = sum(known) // len(known) if known else 10_000_000
+
+    def size_of(f: Path) -> int:
+        return sizes.get(f) or avg
+
+    ratio = max(1, int(gpu_speed_ratio))
+    gpu_files: list[Path] = []
+    cpu_files: list[Path] = []
+    gpu_load = 0.0
+    cpu_load = 0.0
+
+    for f in sorted(files, key=size_of, reverse=True):
+        s = size_of(f)
+        gpu_est = gpu_load + s / ratio
+        cpu_est = cpu_load + s
+        # Tie goes to the GPU lane — it finishes the file sooner and the
+        # CPU lane keeps its current file longer.
+        if gpu_est <= cpu_est:
+            gpu_files.append(f)
+            gpu_load = gpu_est
+        else:
+            cpu_files.append(f)
+            cpu_load = cpu_est
+
+    return HybridPlan(
+        gpu_files=gpu_files,
+        cpu_files=cpu_files,
+        gpu_encoder=gpu_encoder,
+        cpu_budget_threads=max(1, int(logical_threads) - cpu_reserve),
+        gpu_speed_ratio=ratio,
+    )
+
+
+def scan_input_files(in_dir: Path, extensions: set[str]) -> list[Path]:
+    """Collect the transcodable files under *in_dir* (v4.7.0).
+
+    Used by ``EncoderWorker.run()`` for the default whole-directory scan
+    AND by the hybrid scheduler's pre-scan, which must partition the
+    queue BEFORE the per-lane workers are constructed. Excludes leftover
+    pre-scale intermediates from previous failed runs.
+    """
+    return sorted(
+        f for f in in_dir.rglob("*")
+        if f.is_file()
+        and f.suffix.lower() in extensions
+        and not f.name.endswith(".scaled_tmp.mkv")
+    )
+
+
+def selected_gpu_profile(env):
+    """v4.8.0: the active GpuProfile — the UI's dropdown selection
+    (env.av1an_flags["gpu_profile"]) when set, else the auto-matched
+    profile from the probe (env.gpu.profile_key). None when neither."""
+    flags = getattr(env, "av1an_flags", None) or {}
+    key = flags.get("gpu_profile")
+    if key and key != "auto":
+        profile = gpu_profile_by_key(key)
+        if profile is not None:
+            return profile
+    gpu_info = getattr(env, "gpu", None)
+    if gpu_info is not None and getattr(gpu_info, "profile_key", ""):
+        return gpu_profile_by_key(gpu_info.profile_key)
+    return None
+
+
+def resolve_gpu_encoder(engine: str, video_codec, env):
+    """Decide whether this encode runs on the GPU.
+
+    Returns ``(encoder_name, api)`` when the GPU path should be used —
+    e.g. ``("hevc_nvenc", "nvenc")`` or ``("hevc_vaapi", "vaapi")`` — or
+    ``(None, None)`` for the CPU path.
+
+    Rules:
+      - ``engine == "cpu"``              → always CPU (user forced CPU).
+      - selected/matched GPU profile has
+        no encoder for the codec family  → CPU (e.g. AV1 on Pascal,
+                                          VP9 without VAAPI).
+      - ``engine`` auto/gpu AND the
+        functional probe passed for
+        that encoder                     → the encoder.
+
+    The gate is ``env.gpu.functional`` — a live encode test run by the
+    env probe — NOT the compiled-in ``ffmpeg -encoders`` list, because a
+    ffmpeg build can advertise a hardware encoder the installed driver
+    is too old to open. Pure function; no I/O. Safe to call from the UI
+    thread for a pre-flight status line.
+    """
+    if engine not in ("auto", "gpu"):
+        return (None, None)
+    profile = selected_gpu_profile(env)
+    if profile is not None:
+        family = getattr(video_codec, "gpu_family", "") or ""
+        gpu_enc = profile.encoders.get(family)
+        api = profile.api
+    else:
+        # No GPU profile context (older callers / no probe data): fall
+        # back to the profile's NVENC encoder.
+        gpu_enc = getattr(video_codec, "gpu_encoder", "") or ""
+        api = "nvenc" if gpu_enc else None
+    if not gpu_enc:
+        return (None, None)
+    gpu_info = getattr(env, "gpu", None)
+    if gpu_info is not None and gpu_info.functional.get(gpu_enc, False):
+        return (gpu_enc, api)
+    return (None, None)
+
+
+
+
 class EncoderWorker(QThread):
     log_msg       = Signal(str)
     progress_msg  = Signal(str, int, int)   # (filename, current, total)
     finished_queue = Signal(int, int)        # (success_count, fail_count)
+
+    # v4.4.3/v4.6.0: class-level defaults for attributes normally set in
+    # __init__. The mocked test suite builds workers via ``__new__``
+    # (bypassing __init__) and calls non-Qt methods directly; without
+    # these defaults those instances crash with AttributeError on
+    # ``verbose`` / ``_current_total`` (the "AttributeError: no attribute
+    # 'verbose'" class of bugs from the v4.4.3 changelog). Instance
+    # assignment in __init__ shadows these harmlessly.
+    verbose = False
+    _current_idx = 0
+    _current_total = 0
+    _current_filename = ""
 
     def __init__(
         self,
@@ -2655,7 +3188,28 @@ class EncoderWorker(QThread):
         # to honor them.
         max_workers: int | None = None,
         threads_per_worker: int | None = None,
+        # v4.6.0: encode engine selection. "auto" uses the NVENC GPU
+        # encoder when the selected codec family has one AND the env
+        # probe's live encode test proved it works on this system;
+        # otherwise (or with "cpu") the CPU encoders are used. "gpu"
+        # requests GPU and falls back to CPU with a log line when the
+        # hardware is unavailable. Resolved against env.av1an_flags
+        # ["engine"] like the other CLI-plumbed flags.
+        engine: str | None = None,
+        # v4.7.0: hybrid-lane support. *file_subset* restricts this
+        # worker to an explicit file list (the hybrid scheduler scans and
+        # partitions the queue up front, then spawns a GPU-lane and a
+        # CPU-lane worker with disjoint subsets). *lane* suffixes the
+        # per-worker temp dir so one lane's cleanup sweep can never
+        # delete the other lane's intermediates. *ffmpeg_threads* caps
+        # the CPU lane's software ffmpeg encode (GPU jobs are capped by
+        # NVENC silicon, not threads).
+        file_subset: list[Path] | None = None,
+        lane: str = "",
+        ffmpeg_threads: int | None = None,
     ):
+
+
         super().__init__()
         self.in_dir = in_dir
         self.out_dir = out_dir
@@ -2694,6 +3248,22 @@ class EncoderWorker(QThread):
                 ) else None
             )
         )
+        # v4.6.0: engine selection ("auto" | "gpu" | "cpu"). Falls back to
+        # env.av1an_flags["engine"] when not passed explicitly (same
+        # pattern as max_workers — lets the CLI reach the GUI-spawned
+        # worker without ui_window changes). Resolved to a concrete
+        # GPU/CPU decision in run() via resolve_gpu_encoder().
+        self.engine = engine if engine in ("auto", "gpu", "cpu") else (
+            env.av1an_flags.get("engine", "auto")
+            if env.av1an_flags.get("engine") in ("auto", "gpu", "cpu")
+            else "auto"
+        )
+        # Resolved in run(): NVENC encoder name when the GPU path is
+        # active, None for CPU. _ffmpeg_fallback_encode and
+        # _prepare_input read this (GPU mode implies the ffmpeg path —
+        # av1an cannot drive NVENC — which also means no pre-scale
+        # intermediate: the ffmpeg path scales inline).
+        self._gpu_encoder: str | None = None
         # Resolved at run() time — kept on self so _encode_one can read it
         # without changing its call signature (which is invoked recursively
         # by the y4m-pipe-break retry path).
@@ -2742,7 +3312,12 @@ class EncoderWorker(QThread):
         # cleanup sweep can safely nuke only this worker's intermediates
         # without affecting a concurrent worker. The subdir is created
         # with mode=0o700 to prevent symlink attacks from other users.
-        self._temp_dir = _worker_temp_dir(os.getpid())
+        self.file_subset = file_subset
+        self.lane = lane
+        self.ffmpeg_threads = ffmpeg_threads
+        self._temp_dir = _worker_temp_dir(os.getpid(), lane=lane)
+
+
         # v6-06: KeepAwake instance — started in run(), stopped in finally.
         # mouse_nudge defaults to False (opt-in) to avoid surprising the
         # user with cursor movement. systemd-inhibit is always-on when
@@ -3040,7 +3615,25 @@ class EncoderWorker(QThread):
         Returns True on success, False on failure.
         """
         # Check if ffmpeg has the video encoder we need
-        ffmpeg_enc = self.video_codec.ffmpeg_encoder
+        # v4.6.0: GPU mode swaps in the hardware encoder and its vargs.
+        # v4.8.0: VAAPI/QSV APIs build their command shape (device init,
+        # hwupload filter, quality args) from gpu_profiles; NVENC keeps
+        # the original profile vargs.
+        ffmpeg_enc = self._gpu_encoder or self.video_codec.ffmpeg_encoder
+        v_args = (
+            (self.video_codec.gpu_vargs_fn or self.video_codec.ffmpeg_vargs_fn)
+            if self._gpu_encoder else self.video_codec.ffmpeg_vargs_fn
+        )(self.crf, self.preset_val)
+        hw_pre_args: list[str] = []
+        hw_filter_args: list[str] = []
+        if self._gpu_encoder and self._gpu_api in ("vaapi", "qsv"):
+            profile = selected_gpu_profile(self.env)
+            if profile is not None:
+                hw_pre_args = encoder_pre_args(profile)
+                hw_filter_args = encoder_filter_chain(profile)
+                v_args = encoder_quality_args(
+                    self._gpu_api, ffmpeg_enc, self.crf, self.preset_val
+                )
         # v3: use the module-level FFMPEG_LIB_KEY_MAP (OTC-007).
         ffmpeg_lib_key = ffmpeg_lib_key_for(ffmpeg_enc)
 
@@ -3051,19 +3644,29 @@ class EncoderWorker(QThread):
             )
             return False
 
-        v_args = self.video_codec.ffmpeg_vargs_fn(self.crf, self.preset_val)
-
         # Belt-and-suspenders: if a target resolution is set, inject -vf scale
         # directly into the ffmpeg command. This guarantees the output resolution
         # matches the dropdown even if the intermediate pre-scale was bypassed.
         vf_scale_args: list[str] = []
         if self.resolution.width is not None and self.resolution.height is not None:
-            vf_scale_args = [
-                "-vf", (
-                    f"scale={self.resolution.width}:{self.resolution.height}:"
-                    f"force_original_aspect_ratio=decrease:force_divisible_by=2"
-                ),
-            ]
+            if self._gpu_api == "vaapi":
+                # v4.8.0: VAAPI scales ON the hardware — combine the
+                # scalar with the hwupload upload in one chain.
+                vf_scale_args = [
+                    "-vf", (
+                        f"scale={self.resolution.width}:{self.resolution.height}:"
+                        f"force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                        f"format=nv12,hwupload"
+                    ),
+                ]
+                hw_filter_args = []
+            else:
+                vf_scale_args = [
+                    "-vf", (
+                        f"scale={self.resolution.width}:{self.resolution.height}:"
+                        f"force_original_aspect_ratio=decrease:force_divisible_by=2"
+                    ),
+                ]
 
         # Audio args from profile
         audio_args = list(self.audio_profile.params)
@@ -3084,10 +3687,37 @@ class EncoderWorker(QThread):
         if self.container.ext == "mp4":
             mux_flags = ["-movflags", "+faststart"]
 
-        cmd = [
-            self.env.ffmpeg_path,
+        cmd = [self.env.ffmpeg_path] + hw_pre_args + [
             "-i", str(encode_input),
-        ] + vf_scale_args + v_args + audio_args + mux_flags + [
+        ] + vf_scale_args + hw_filter_args + v_args
+        # v4.7.0: CPU lane thread cap in hybrid mode (the GPU lane's
+        # NVENC job keeps ~2 threads for decode/mux). Never applied on
+        # the GPU path — NVENC throughput is silicon-bound, not
+        # thread-bound. Skipped when the cap is 0/unset.
+        if self._gpu_encoder is None and self.ffmpeg_threads:
+            # v4.7.1: libx265 maps -threads to frame-threads, capped at
+            # X265_MAX_FRAME_THREADS (16) — larger values abort the
+            # encoder ("frameNumThreads must be [0 .. X265_MAX_FRAME_
+            # THREADS)"). SVT-AV1 and libvpx accept the full budget.
+            threads = self.ffmpeg_threads
+            if ffmpeg_enc == "libx265":
+                threads = min(threads, 16)
+            cmd += ["-threads", str(threads)]
+
+        # v4.7.0: CPU lane thread cap in hybrid mode (the GPU lane's
+        # NVENC job keeps ~2 threads for decode/mux). Never applied on
+        # the GPU path — NVENC throughput is silicon-bound, not
+        # thread-bound. Skipped when the cap is 0/unset.
+        if self._gpu_encoder is None and self.ffmpeg_threads:
+            # v4.7.1: libx265 maps -threads to frame-threads, capped at
+            # X265_MAX_FRAME_THREADS (16) — larger values abort the
+            # encoder ("frameNumThreads must be [0 .. X265_MAX_FRAME_
+            # THREADS)"). SVT-AV1 and libvpx accept the full budget.
+            threads = self.ffmpeg_threads
+            if ffmpeg_enc == "libx265":
+                threads = min(threads, 16)
+            cmd += ["-threads", str(threads)]
+        cmd += audio_args + mux_flags + [
             "-y",
             str(output_f),
         ]
@@ -3133,6 +3763,11 @@ class EncoderWorker(QThread):
                 self.log_msg.emit(
                     f"  ffmpeg error (rc={res.returncode}): {stderr_snip.strip()}"
                 )
+                # v4.7.1: remove the partial output. Without this, a
+                # failed encode left a truncated file that ffprobe can
+                # still parse as the right codec — and skip-existing
+                # would then treat it as a finished archive forever.
+                output_f.unlink(missing_ok=True)
                 return False
         except OSError as e:
             self.log_msg.emit(f"{self._status_prefix()}FAIL: system error: {e}")
@@ -3154,14 +3789,45 @@ class EncoderWorker(QThread):
         phys = self.env.cpu.physical_cores
         logical = self.env.cpu.logical_threads
 
+        # ── v4.6.0: engine resolution (GPU vs CPU) ──
+        # GPU mode is a variant of the ffmpeg path: av1an invokes
+        # encoder CLI binaries (SvtAv1EncApp / vpxenc / x265) and cannot
+        # drive NVENC, so an active GPU encoder forces the single-pass
+        # ffmpeg path. NVENC on even a GTX 1070 encodes 1080p at several
+        # hundred fps — one ffmpeg process beats av1an's chunk-parallel
+        # CPU workers, and chunking becomes unnecessary.
+        self._gpu_encoder, self._gpu_api = resolve_gpu_encoder(
+            self.engine, self.video_codec, self.env)
+        if self._gpu_encoder:
+            self.use_ffmpeg_fallback = True
+            self.log_msg.emit(
+                f"ENGINE: GPU ({self._gpu_encoder}, {self._gpu_api}) — "
+                f"single-pass ffmpeg hardware encode; av1an chunk-parallel "
+                f"not used."
+            )
+        elif self.engine == "gpu":
+            gpu_enc = getattr(self.video_codec, "gpu_encoder", "") or ""
+            if not gpu_enc and not getattr(self.video_codec, "gpu_family", ""):
+                self.log_msg.emit(
+                    f"ENGINE: GPU requested but {self.video_codec.label} has no "
+                    f"hardware encoder — using CPU."
+                )
+            else:
+                gpu = getattr(self.env, "gpu", None)
+                detail = gpu.first_failure_detail if gpu is not None else ""
+                self.log_msg.emit(
+                    f"ENGINE: GPU requested but no usable hardware encoder for "
+                    f"{self.video_codec.label} ({detail or 'unavailable'}) — using CPU."
+                )
+
         # Collect all valid files first (for progress tracking)
         # Exclude our own temp intermediates from previous failed runs.
-        all_files = sorted(
-            f for f in self.in_dir.rglob("*")
-            if f.is_file()
-            and f.suffix.lower() in self.extensions
-            and not f.name.endswith(".scaled_tmp.mkv")
-        )
+        if self.file_subset is not None:
+            # v4.7.0: hybrid lane — the scheduler partitioned the queue.
+            all_files = sorted(self.file_subset)
+        else:
+            all_files = scan_input_files(self.in_dir, self.extensions)
+
         total = len(all_files)
 
         if total == 0:
@@ -3170,30 +3836,37 @@ class EncoderWorker(QThread):
             return
 
         # ── Mode banner ──
+        # v4.2.1: mode banner is verbose-only. The user doesn't need
+        # to know the worker math — they just need files to encode.
         # use_ffmpeg_fallback is set by the main thread's pre-flight check.
-        # If True, the main thread already logged the fallback reason.
-        if self.use_ffmpeg_fallback:
-            self.log_msg.emit(
-                f"FFmpeg fallback: {self.video_codec.ffmpeg_encoder} on {phys} cores "
-                f"(single-pass, no chunk-parallel)"
-            )
-        else:
-            # v4.1.0: show the thread budget so the user can verify the
-            # intelligent worker math at a glance. e.g. on a 28-thread Xeon:
-            #   "Chunk-parallel: 6 workers × 4 threads = 24 active
-            #    (28 logical - 4 reserved for OS/UI)"
-            active = worker_count * threads_per_worker
-            reserved = logical - active
-            self.log_msg.emit(
-                f"Chunk-parallel: {worker_count} workers × {threads_per_worker} threads "
-                f"= {active} active "
-                f"({logical} logical - {reserved} reserved for OS/UI)"
-            )
-            if self.max_workers is not None or self.threads_per_worker_override is not None:
-                self.log_msg.emit(
-                    f"  (overrides: max_workers={self.max_workers!r}, "
-                    f"threads_per_worker={self.threads_per_worker_override!r})"
+        if self.verbose:
+            if self._gpu_encoder:
+                self._vlog(
+                    f"GPU encode: {self.video_codec.label} via "
+                    f"{self._gpu_encoder} (NVENC), CPU decode"
                 )
+            elif self.use_ffmpeg_fallback:
+                self._vlog(
+                    f"FFmpeg fallback: {self.video_codec.ffmpeg_encoder} on {phys} cores "
+                    f"(single-pass, no chunk-parallel)"
+                )
+            else:
+                # v4.1.0: show the thread budget so the user can verify the
+                # intelligent worker math at a glance. e.g. on a 28-thread Xeon:
+                #   "Chunk-parallel: 6 workers × 4 threads = 24 active
+                #    (28 logical - 4 reserved for OS/UI)"
+                active = worker_count * threads_per_worker
+                reserved = logical - active
+                self._vlog(
+                    f"Chunk-parallel: {worker_count} workers × {threads_per_worker} threads "
+                    f"= {active} active "
+                    f"({logical} logical - {reserved} reserved for OS/UI)"
+                )
+                if self.max_workers is not None or self.threads_per_worker_override is not None:
+                    self._vlog(
+                        f"  (overrides: max_workers={self.max_workers!r}, "
+                        f"threads_per_worker={self.threads_per_worker_override!r})"
+                    )
         self.log_msg.emit(f"Found {total} file(s) to process.")
         self.log_msg.emit(f"Temp dir: {self._temp_dir}")
 
@@ -3590,7 +4263,15 @@ class EncoderWorker(QThread):
         # temp directory so the user's video folders stay clean.
         encode_input = file_path
 
-        if needs_scale and not self.inline_scale:
+        # v4.6.0: pre-scale ONLY on the av1an path. The pure-ffmpeg path
+        # (the default, and the only path NVENC can run on) scales inline
+        # via the -vf args in _ffmpeg_fallback_encode — the intermediate
+        # existed solely because VapourSynth source plugins choke on some
+        # inputs ffmpeg handles fine. Skipping it on the ffmpeg path
+        # removes the entire class of large-file failures: no 0.5-0.8x
+        # source-size temp file, no extra full encode pass, and no
+        # pre-scale timeout on long/high-bitrate sources.
+        if needs_scale and not self.inline_scale and not self.use_ffmpeg_fallback:
             try:
                 temp_scaled = _temp_path_for(file_path, ".scaled_tmp.mkv", worker_dir=self._temp_dir)
                 self._current_temps.append(temp_scaled)
@@ -3613,33 +4294,57 @@ class EncoderWorker(QThread):
                     "-c:v", "libx265",
                     "-crf", "16",            # visually lossless — was 0 (mathematically lossless)
                     "-preset", "ultrafast",
-                    "-pix_fmt", "yuv420p",    # force 8-bit 4:2:0
+                    "-pix_fmt", "yuv420p",   # force 8-bit 4:2:0
                     "-y",
                     str(temp_scaled),
                 ]
-                self.log_msg.emit(f"  Scaling {src_w or '?'}x{src_h or '?'} -> {self.resolution.width}x{self.resolution.height}...")
-                scale_res = subprocess.run(
-                    scale_cmd, capture_output=True, text=True, timeout=1800,
+                # v4.2.1: Scaling notice is verbose-only.
+                self._vlog(f"  Scaling {src_w or '?'}x{src_h or '?'} -> {self.resolution.width}x{self.resolution.height}...")
+                # v4.6.0: run via _run_with_stop_check with the full
+                # per-file timeout. The old flat
+                # subprocess.run(timeout=1800) killed pre-scaling of
+                # long/high-bitrate sources at exactly 30 minutes
+                # ("FAIL: pre-scale error: Command ... timed out") — a
+                # guaranteed large-file failure that also ignored the
+                # STOP button for the whole intermediate pass.
+                scale_status, scale_rc, _s_out, scale_err = self._run_with_stop_check(
+                    scale_cmd, timeout=self.encode_timeout, log_prefix="  ",
                 )
-                if scale_res.returncode == 0 and temp_scaled.exists():
+                if scale_status == "stop":
+                    # User aborted — clean up the partial intermediate and
+                    # bail WITHOUT counting a failure (a STOP is not an
+                    # encode failure; the queue loop breaks next iteration).
+                    self._cleanup_current_temps()
+                    return None
+                if scale_status == "timeout":
+                    self.log_msg.emit(
+                        f"{self._status_prefix()}FAIL: pre-scale timeout "
+                        f"(exceeded {self.encode_timeout}s limit)"
+                    )
+                    temp_scaled.unlink(missing_ok=True)
+                    self._cleanup_current_temps()
+                    self.fail_count += 1
+                    return None
+                if scale_status == "ok" and scale_rc == 0 and temp_scaled.exists():
                     encode_input = temp_scaled
                     scaled_size = temp_scaled.stat().st_size / 1_048_576
-                    self.log_msg.emit(f"  Pre-scale OK ({scaled_size:.1f} MB intermediate)")
+                    # v4.2.1: verbose-only
+                    self._vlog(f"  Pre-scale OK ({scaled_size:.1f} MB intermediate)")
                 else:
-                    stderr_snip = (scale_res.stderr or "")[-200:]
+                    stderr_snip = (scale_err or "")[-200:]
+                    # v4.2.1: keep user-facing FAIL but shorten; stderr verbose-only
                     self.log_msg.emit(
-                        f"{self._status_prefix()}FAIL: pre-scale failed (rc={scale_res.returncode})"
+                        f"{self._status_prefix()}FAIL: pre-scale failed (rc={scale_rc})"
                     )
                     if stderr_snip.strip():
-                        self.log_msg.emit(f"  ffmpeg stderr: {stderr_snip.strip()}")
+                        self._vlog(f"  ffmpeg stderr: {stderr_snip.strip()}")
                     temp_scaled.unlink(missing_ok=True)
                     self._cleanup_current_temps()
                     self.fail_count += 1
                     return None
             except (OSError, subprocess.SubprocessError) as e:
-                self.log_msg.emit(
-                    f"{self._status_prefix()}FAIL: pre-scale error: {e}"
-                )
+                # v4.2.1: keep user-facing but shorten
+                self.log_msg.emit(f"{self._status_prefix()}FAIL: pre-scale error: {e}")
                 self._cleanup_current_temps()
                 self.fail_count += 1
                 return None
@@ -3680,19 +4385,27 @@ class EncoderWorker(QThread):
         return (encode_input, output_f)
 
     def _check_disk_space(self, file_path: Path, output_f: Path, needs_scale: bool) -> None:
-        """v4.4.0: Warn (not abort) if free disk space is less than the source size.
+        """v4.4.0: Warn if free disk space is less than the encode will need.
 
-        v4.4.1: warnings gated behind --verbose. Quiet mode = zero output.
+        v4.6.0: SEVERE warnings (free space below the source size on the
+        partition we're about to write a big intermediate/output to) are
+        now USER-FACING — they were verbose-only, so in the default quiet
+        mode a batch that was going to die with "No space left on device"
+        partway through gave zero advance notice. That silent failure was
+        one of the "large files just fail" reports: small files fit in
+        the remaining space, big ones didn't. Marginal advice (the 2-3x
+        intermediate estimate) stays verbose-only.
         """
-        if not self.verbose:
-            return  # v4.4.1: quiet mode — no disk-space warnings
         try:
             src_size = file_path.stat().st_size
         except OSError:
-            return
+            return  # can't stat source — skip the check
         if src_size < 1_073_741_824:  # < 1 GB — skip check for small files
             return
         src_gb = src_size / 1_073_741_824
+        # Check output partition — severe when free < source size
+        # (the encoded output is usually smaller, but the ffmpeg/av1an
+        # buffer cache plus a same-partition temp can eat the difference).
         try:
             out_usage = shutil.disk_usage(output_f.parent)
             out_free_gb = out_usage.free / 1_073_741_824
@@ -3701,15 +4414,31 @@ class EncoderWorker(QThread):
                     f"  WARN: low disk space on output ({out_free_gb:.1f} GB free, "
                     f"source is {src_gb:.1f} GB) — encode may fail partway through"
                 )
+            elif self.verbose and out_free_gb < src_gb * 2:
+                self._vlog(
+                    f"  WARN: output space getting tight ({out_free_gb:.1f} GB free, "
+                    f"source is {src_gb:.1f} GB)"
+                )
         except OSError:
-            pass
-        if needs_scale:
+            pass  # can't check — skip
+        # When scaling on the av1an path, also check the temp partition
+        # (the CRF-16 intermediate can be ~1x source size). The ffmpeg
+        # path scales inline (no intermediate), so no temp warning there.
+        if needs_scale and not self.use_ffmpeg_fallback:
             try:
                 tmp_usage = shutil.disk_usage(self._temp_dir)
                 tmp_free_gb = tmp_usage.free / 1_073_741_824
-                if tmp_free_gb < src_gb * 2:
+                # Severe: free temp space below the source size means the
+                # intermediate will likely not fit → user-facing warning.
+                if tmp_free_gb < src_gb:
                     self.log_msg.emit(
                         f"  WARN: low disk space on temp ({tmp_free_gb:.1f} GB free, "
+                        f"source is {src_gb:.1f} GB) — the scale intermediate "
+                        f"may not fit. Free space or enable 'Inline scale'."
+                    )
+                elif self.verbose and tmp_free_gb < src_gb * 2:
+                    self._vlog(
+                        f"  WARN: temp space getting tight ({tmp_free_gb:.1f} GB free, "
                         f"lossless intermediate may need ~{src_gb * 2:.1f} GB) — "
                         f"consider scaling to a smaller resolution or freeing space"
                     )
@@ -3923,10 +4652,20 @@ class EncoderWorker(QThread):
                     return False
             else:
                 stderr_full = res.stderr or ""
+                # v4.6.0: scan stdout too. av1an routes chunk-retry
+                # noise (encoder stderr dumps, FRAME MISMATCH lines)
+                # to stdout, so pattern-matching on stderr alone missed
+                # the biggest real-world failure mode (see the FRAME
+                # MISMATCH pattern below).
+                combined_out = stderr_full + "\n" + (res.stdout or "")
                 # v6: Don't increment fail_count yet — we may retry with
                 # ffmpeg fallback below. Only increment if the retry also
                 # fails (or no retry is possible).
-                # v4.4.2: move FAIL to _vlog. User only sees final outcome.
+                # v4.4.2: move the FAIL line to _vlog. If the ffmpeg
+                # fallback succeeds, the user sees OK. If it also fails,
+                # the RETRY FAIL path emits a user-facing FAIL. This way
+                # the user doesn't see a confusing "FAIL then OK" for
+                # files that av1an choked on but ffmpeg handled.
                 self._vlog(
                     f"{self._status_prefix()}av1an failed (exit code {res.returncode}) — attempting ffmpeg fallback"
                 )
@@ -4054,10 +4793,56 @@ class EncoderWorker(QThread):
                         ),
                         False,  # don't stop queue — retry with select chunk method
                     ),
+                    # v4.6.0: ffmpeg ≥ 7 removed the -vsync option that
+                    # av1an's segment/hybrid chunk extraction passes to
+                    # ffmpeg. Every segment-based chunk dies immediately
+                    # ("Unrecognized option 'vsync'." → empty y4m pipe →
+                    # chunk fails 3x). Verified on ffmpeg 9.0.2 + av1an
+                    # 0.5.2. select (or a VS source plugin method) is the
+                    # only working chunking on these systems.
+                    (
+                        "Unrecognized option 'vsync'",
+                        "av1an's segment/hybrid chunk extraction calls "
+                        "`ffmpeg -vsync`, which ffmpeg 7+ removed. Every "
+                        "segment-based chunk fails instantly on this system.",
+                        (
+                            "  FIX: install a VapourSynth source plugin so av1an",
+                            "  stops using ffmpeg segmenting: bestsource/ffms2/",
+                            "  lsmash (e.g. on Arch: vapoursynth-plugin-bs).",
+                            "  Alternatively stay on the default ffmpeg-only path",
+                            "  (it doesn't use av1an chunking at all).",
+                        ),
+                        False,  # per-file — the select override keeps other files working
+                    ),
+                    # v4.6.0: frame-count drift between av1an's chunk
+                    # manifest and what the encoder actually produced.
+                    # av1an retries the chunk 3x, then shuts the worker
+                    # down with the baffling "encoder crashed: exit
+                    # status: 0" (exit 0 because the encode itself
+                    # succeeded — on partial data). This was the dominant
+                    # large-file failure in the 2026-07-13 av1an log and
+                    # previously fell through to "Unknown av1an failure".
+                    (
+                        "FRAME MISMATCH",
+                        "av1an's chunk manifest expected a different frame count "
+                        "than the encoder produced — chunk-extraction drift on "
+                        "sources with sparse/irregular keyframes. The encode "
+                        "itself exits 0 (it ran on partial data), which av1an "
+                        "reports as 'encoder crashed: exit status: 0'.",
+                        (
+                            "  Will retry with --chunk-method select, which",
+                            "  extracts exact frame ranges and cannot drift.",
+                            "  This is per-file, not systematic — subsequent",
+                            "  files use select automatically.",
+                        ),
+                        False,  # don't stop queue — retry with select chunk method
+                    ),
                 )
                 diagnosis_emitted = False
                 for marker, summary, fixes, stop_queue in error_patterns:
-                    if marker.lower() in stderr_full.lower():
+                    # v4.6.0: scan stdout + stderr (FRAME MISMATCH and
+                    # encoder dumps land in stdout).
+                    if marker.lower() in combined_out.lower():
                         self.log_msg.emit("")
                         self.log_msg.emit(f"DIAGNOSIS: {summary}")
                         for fix in fixes:
@@ -4106,7 +4891,8 @@ class EncoderWorker(QThread):
                     # as concat failures.
                     if ("SUMMARY" in stderr_full
                             and "Average Speed" in stderr_full
-                            and "Failed to read y4m frame delimiter" not in stderr_full):
+                            and "Failed to read y4m frame delimiter" not in combined_out
+                            and "FRAME MISMATCH" not in combined_out):
                         self.log_msg.emit("")
                         self.log_msg.emit(
                             "DIAGNOSIS: SVT-AV1 encoder completed successfully (SUMMARY"
@@ -4143,18 +4929,34 @@ class EncoderWorker(QThread):
                 # same params). Cache the working method so subsequent files
                 # skip the wasted first attempt.
                 #
+                # v4.6.0: FRAME MISMATCH (chunk-extraction drift, see the
+                # error-pattern table) joins the y4m break as a drift
+                # symptom that select fixes — it was previously an
+                # "Unknown av1an failure" that went straight to the slow
+                # full-file ffmpeg fallback.
+                #
                 # NOTE: Do NOT clean up _current_temps before the retry —
                 # encode_input (symlink or pre-scaled file) is in
                 # _current_temps and the recursive _encode_one call needs it.
                 # The finally block below will clean up everything after the
                 # recursive call returns (its own finally clears the list
                 # first; our finally then runs on an empty list — no-op).
-                y4m_break = "Failed to read y4m frame delimiter" in stderr_full
-                if (not self._stop and y4m_break
+                extraction_drift = (
+                    "Failed to read y4m frame delimiter" in combined_out
+                    or "FRAME MISMATCH" in combined_out
+                    # ffmpeg >= 7 removed -vsync: segment/hybrid chunking
+                    # dies instantly while select still works (it uses the
+                    # ffmpeg frame server, not segmenting).
+                    or "Unrecognized option 'vsync'" in combined_out
+                )
+                if (not self._stop and extraction_drift
                         and effective_chunk_method != "select"
                         and self.env.av1an_flags.get("has_chunk_method", True)):
-                    self.log_msg.emit("")
-                    self.log_msg.emit(
+                    # v4.2.1: RETRY messages are verbose-only — the user
+                    # already saw "FAIL" and will see "SUCCESS" if the retry
+                    # works. They don't need to know the retry is happening.
+                    self._vlog("")
+                    self._vlog(
                         f"  RETRY: Re-encoding {file_path.name} with "
                         f"--chunk-method select (slower but reliable for "
                         f"files with sparse keyframes)..."
@@ -4389,9 +5191,15 @@ class EncoderWorker(QThread):
 
         try:
             # Pass 1: analyze current loudness
+            # v4.6.0: -vn skips video decoding — without it the analysis
+            # decoded the ENTIRE video stream just to measure audio
+            # loudness, which pushed long/large files past the 120s
+            # timeout and silently degraded every big file to the static
+            # knob gain.
             analysis_cmd = [
                 self.env.ffmpeg_path,
                 "-i", str(file_path),
+                "-vn",
                 "-af", (
                     f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11:"
                     f"print_format=json"
@@ -4531,6 +5339,346 @@ class EncoderWorker(QThread):
 #  SOURCE BUILD WORKER — compile VS + av1an from git
 # ──────────────────────────────────────────────
 
+# ──────────────────────────────────────────────
+#  BUILD DEPENDENCY TREE (v4.7.1 — distro-aware)
+# ──────────────────────────────────────────────
+
+# Binaries the build needs. pkgconf/pkg-config and python/python3 are
+# aliased — any one of each pair satisfies the check.
+BUILD_TOOL_ALIASES: dict[str, tuple[str, ...]] = {
+    "git": ("git",),
+    "meson": ("meson",),
+    "ninja": ("ninja",),
+    "c++ compiler": ("g++", "c++", "clang++"),
+    "make": ("make",),
+    "pkg-config": ("pkg-config", "pkgconf"),
+    "python3": ("python3",),
+    "nasm": ("nasm",),
+    "cmake": ("cmake",),
+}
+
+# Packages providing the toolchain + the libraries the builds link
+# against (zimg is VapourSynth's one hard library dependency; rust is
+# only needed for the av1an build).
+BUILD_DEPS_BY_FAMILY: dict[str, list[str]] = {
+    "arch":   ["base-devel", "meson", "ninja", "cmake", "nasm", "git",
+               "python", "pkgconf", "zimg", "rust"],
+    "debian": ["build-essential", "meson", "ninja-build", "cmake", "nasm",
+               "git", "python3", "python3-dev", "pkg-config", "libzimg-dev",
+               "cargo", "rustc"],
+    "redhat": ["gcc", "gcc-c++", "make", "meson", "ninja-build", "cmake",
+               "nasm", "git", "python3", "python3-devel",
+               "pkgconf-pkg-config", "zimg-devel", "cargo", "rust"],
+    "suse":   ["gcc", "gcc-c++", "make", "meson", "ninja", "cmake", "nasm",
+               "git", "python3", "python3-devel", "pkg-config",
+               "zimg-devel", "rust", "cargo"],
+}
+
+PKG_INSTALL_CMD: dict[str, list[str]] = {
+    "arch":   ["pacman", "-S", "--needed", "--noconfirm"],
+    "debian": ["apt-get", "install", "-y"],
+    "redhat": ["dnf", "install", "-y"],
+    "suse":   ["zypper", "--non-interactive", "install"],
+}
+
+MANUAL_DEP_NOTE = (
+    "No automatic package install for this distro family. Install a C++ "
+    "toolchain plus meson, ninja, cmake, nasm, git, python3, pkg-config, "
+    "zimg development headers{rust} manually, then press REBUILD again."
+)
+
+GPU_BUILD_PACKAGES: dict[str, dict[str, list[str]]] = {
+    "nvenc": {
+        "arch":   ["nv-codec-headers"],
+        "debian": [],
+        "redhat": [],
+        "suse":   [],
+    },
+    "vaapi": {
+        "arch":   ["libva", "libdrm", "mesa"],
+        "debian": ["libva-dev", "libdrm-dev", "mesa-va-drivers"],
+        "redhat": ["libva-devel", "libdrm-devel", "mesa-va-drivers"],
+        "suse":   ["libva-devel", "libdrm-devel", "Mesa-libva"],
+    },
+    "qsv": {
+        "arch":   ["libva", "intel-media-driver", "onevpl"],
+        "debian": ["libva-dev", "intel-media-va-driver-non-free", "libvpl-dev"],
+        "redhat": ["libva-devel", "intel-media-driver", "oneVPL-devel"],
+        "suse":   ["libva-devel", "intel-media-driver", "oneVPL-devel"],
+    },
+}
+
+
+
+
+
+
+
+@dataclass
+class DepPlan:
+    """What the rebuild needs, and how to get it on this distro."""
+    packages: list[str] = field(default_factory=list)
+    install_cmd: list[str] | None = None
+    manual_note: str | None = None
+
+
+def build_dep_plan(distro: DistroProfile, build_av1an: bool = True) -> DepPlan:
+    """Pure: the package list + install command for this distro family.
+
+    Works even when the environment probe failed — it only needs the
+    distro family, which is detectable from /etc/os-release alone.
+    """
+    packages = list(BUILD_DEPS_BY_FAMILY.get(distro.family, []))
+    if not build_av1an:
+        for rust_pkg in ("rust", "rustc", "cargo"):
+            if rust_pkg in packages:
+                packages.remove(rust_pkg)
+    install_cmd = PKG_INSTALL_CMD.get(distro.family)
+    manual_note = None
+    if not install_cmd or not packages:
+        manual_note = MANUAL_DEP_NOTE.format(
+            rust=" and Rust/cargo" if build_av1an else "")
+    return DepPlan(packages=packages, install_cmd=install_cmd,
+                   manual_note=manual_note)
+
+"""GPU capability profiles (v4.8.0) — combined card generations.
+
+Cards within the same hardware-encoder generation are functionally
+identical for transcoding, so the dropdown lists CAPABILITY CLASSES,
+not individual SKUs: one Pascal entry covers the GTX 10-series, Tesla
+P40/P4/P100 and mobile chips; one Turing entry covers RTX 20-series,
+GTX 16-series, the Tesla T4 and the crypto-era CMP 30/40/50HX cards.
+
+Oddballs are included with their real capabilities:
+  - CMP 90HX is GA102-based (Ampere NVENC), but CMP 170HX is GA100-based
+    and has NO NVENC at all (like A100/V100/H100 compute boards).
+  - Intel Arc (QSV) and AMD RDNA (VAAPI) cover the rest of the trending
+    list; RDNA 3 added AV1 encode, RDNA 1/2 and GCN can only encode
+    H.264/HEVC.
+
+Pure data + pure functions: no I/O, safe to import anywhere.
+"""
+
+
+import re
+from dataclasses import dataclass
+
+# ──────────────────────────────────────────────
+#  GPU PROFILES
+# ──────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class GpuProfile:
+    key: str                    # stable id (CLI/UI)
+    label: str                  # dropdown entry
+    vendor: str                 # nvidia | amd | intel | none
+    api: str                    # nvenc | vaapi | qsv | none
+    # codec family → ffmpeg encoder name
+    encoders: dict[str, str]
+    # case-insensitive substrings matched against the detected GPU name
+    # (nvidia-smi / lspci) for auto-detection. First match wins; lists
+    # are ordered most-specific first.
+    match: tuple[str, ...] = ()
+    notes: str = ""
+    # extra args that must come BEFORE -i (hardware device init)
+    hw_device_args: tuple[str, ...] = ()
+    # filter-chain fragment required before the encoder (vaapi hwupload)
+    filter_tail: tuple[str, ...] = ()
+
+
+# NVENC encoders by generation class. Quality control: -rc vbr -cq N
+# (-b:v 0). 8-bit yuv420p everywhere — Pascal 10-bit HEVC runs at half
+# speed and the archival targets here are 8-bit sources.
+_NV = {"h264": "h264_nvenc", "hevc": "hevc_nvenc"}
+
+GPU_PROFILES: list[GpuProfile] = [
+    GpuProfile(
+        key="nv-kepler-maxwell",
+        label="NVIDIA Kepler / Maxwell 1.0 (GTX 600/700/800M) — H.264 only",
+        vendor="nvidia", api="nvenc",
+        encoders={"h264": "h264_nvenc"},
+        match=("GTX 6", "GTX 7", "GT 7", "GTX 8", "GT 8", "840M", "860M", "750"),
+        notes="First NVENC generations: H.264 only, no HEVC.",
+    ),
+    GpuProfile(
+        key="nv-pascal",
+        label="NVIDIA Pascal (GTX 10-series, TITAN Xp, Tesla P40/P4/P100) — H.264 + HEVC 8/10-bit",
+        vendor="nvidia", api="nvenc",
+        encoders=dict(_NV),
+        match=("GTX 10", "1070", "1080", "1060", "1050", "TITAN Xp",
+               "Tesla P40", "Tesla P4", "P100", "Quadro P"),
+        notes="Pascal NVENC: HEVC Main/Main10. 10-bit runs at ~half speed.",
+    ),
+    GpuProfile(
+        key="nv-turing",
+        label="NVIDIA Turing (RTX 20-series, GTX 16-series, Tesla T4, CMP 30/40/50HX) — H.264 + HEVC + B-frames",
+        vendor="nvidia", api="nvenc",
+        encoders=dict(_NV),
+        match=("RTX 20", "GTX 16", "2060", "2070", "2080", "1660", "1650",
+               "Tesla T4", "CMP 30", "CMP 40", "CMP 50"),
+        notes="Turing NVENC: first gen with HEVC B-frames; big quality jump.",
+    ),
+    GpuProfile(
+        key="nv-ampere",
+        label="NVIDIA Ampere (RTX 30-series, A10/A40/A2, CMP 90HX) — H.264 + HEVC (no AV1 encode)",
+        vendor="nvidia", api="nvenc",
+        encoders=dict(_NV),
+        match=("RTX 30", "3090", "3080", "3070", "3060", "3050",
+               "A10 ", "A40", "A2 ", "CMP 90"),
+        notes="Ampere added AV1 DECODE but not encode — AV1 stays on CPU.",
+    ),
+    GpuProfile(
+        key="nv-ada",
+        label="NVIDIA Ada / Blackwell (RTX 40/50-series, L4/L40) — H.264 + HEVC + AV1 10-bit",
+        vendor="nvidia", api="nvenc",
+        encoders={"h264": "h264_nvenc", "hevc": "hevc_nvenc", "av1": "av1_nvenc"},
+        match=("RTX 40", "RTX 50", "4090", "4080", "4070", "4060",
+               "5090", "5080", "5070", "5060", "L4", "L40"),
+        notes="Ada introduced AV1 NVENC; Blackwell doubles AV1 throughput.",
+    ),
+    GpuProfile(
+        key="nv-compute",
+        label="NVIDIA data-center compute (V100/A100/H100, CMP 170HX) — no NVENC (CPU path)",
+        vendor="nvidia", api="none",
+        encoders={},
+        match=("V100", "A100", "H100", "B200", "GB200", "CMP 170"),
+        notes="Compute boards ship without NVENC silicon. CMP 170HX is "
+              "GA100-based — the fastest mining card that cannot hardware-encode.",
+    ),
+    GpuProfile(
+        key="intel-arc",
+        label="Intel Arc (Alchemist A-series, Battlemage B-series) — QSV: H.264 + HEVC + AV1",
+        vendor="intel", api="qsv",
+        encoders={"h264": "h264_qsv", "hevc": "hevc_qsv", "av1": "av1_qsv"},
+        match=("Arc A", "Arc B", "A380", "A750", "A770", "B570", "B580"),
+        notes="Arc media engines encode AV1 8/10-bit — best value encode card.",
+    ),
+    GpuProfile(
+        key="intel-xe",
+        label="Intel Iris / UHD integrated (Gen9–Xe) — QSV: H.264 + HEVC",
+        vendor="intel", api="qsv",
+        encoders={"h264": "h264_qsv", "hevc": "hevc_qsv"},
+        match=("Iris", "UHD", "HD Graphics"),
+        notes="Integrated media engines; HEVC 8/10-bit, no AV1 encode.",
+    ),
+    GpuProfile(
+        key="amd-rdna3",
+        label="AMD RDNA 3 (RX 7000-series) — VAAPI: H.264 + HEVC + AV1",
+        vendor="amd", api="vaapi",
+        encoders={"h264": "h264_vaapi", "hevc": "hevc_vaapi", "av1": "av1_vaapi"},
+        match=("RX 7", "7900", "7800", "7700", "7600"),
+        notes="RDNA 3 VCN: first AMD generation with AV1 encode.",
+    ),
+    GpuProfile(
+        key="amd-rdna12",
+        label="AMD RDNA 1/2 (RX 5000/6000-series) — VAAPI: H.264 + HEVC (AV1 decode only)",
+        vendor="amd", api="vaapi",
+        encoders={"h264": "h264_vaapi", "hevc": "hevc_vaapi"},
+        match=("RX 5", "RX 6", "5700", "5600", "6800", "6700", "6600", "6500"),
+        notes="RDNA 2 has AV1 decode only — AV1 encode stays on CPU.",
+    ),
+    GpuProfile(
+        key="amd-gcn",
+        label="AMD GCN 4/5 / Vega (RX 400/500, Vega 56/64) — VAAPI: H.264 + HEVC",
+        vendor="amd", api="vaapi",
+        encoders={"h264": "h264_vaapi", "hevc": "hevc_vaapi"},
+        match=("RX 4", "RX 5", "Vega", "580", "570", "480", "470", "64", "56"),
+        notes="The classic crypto-era mining cards (Polaris/Vega).",
+    ),
+    GpuProfile(
+        key="cpu",
+        label="None (CPU-only encode)",
+        vendor="none", api="none",
+        encoders={},
+    ),
+]
+
+GPU_PROFILES_BY_KEY: dict[str, GpuProfile] = {p.key: p for p in GPU_PROFILES}
+
+
+def gpu_profile_by_key(key: str | None) -> GpuProfile | None:
+    if not key:
+        return None
+    return GPU_PROFILES_BY_KEY.get(key)
+
+
+def match_gpu_profile(gpu_name: str) -> GpuProfile | None:
+    """Best-effort auto-detection from a GPU name string (nvidia-smi or
+    lspci output). Case-insensitive; first matching profile wins (the
+    match lists are ordered most-specific first, and the compute boards
+    are matched before the consumer generations they share names with —
+    e.g. 'CMP 170HX' must not hit the Ampere 'A10' style entries)."""
+    if not gpu_name:
+        return None
+    name = gpu_name.lower()
+    for profile in GPU_PROFILES:
+        for frag in profile.match:
+            if frag.lower() in name:
+                return profile
+    return None
+
+
+# ──────────────────────────────────────────────
+#  FFMPEG ARG HELPERS (per hardware API)
+# ──────────────────────────────────────────────
+
+def encoder_for_family(profile: GpuProfile | None, family: str) -> str | None:
+    """Hardware encoder name for a codec family on this profile, or None."""
+    if not profile or profile.api == "none":
+        return None
+    return profile.encoders.get(family)
+
+
+def resolve_vaapi_device() -> str:
+    """First render node, or the classic fallback path. (Best-effort I/O —
+    callers that need purity pass the result into encoder_pre_args.)"""
+    import glob
+    nodes = sorted(glob.glob("/dev/dri/renderD*"))
+    return nodes[0] if nodes else "/dev/dri/renderD128"
+
+
+def encoder_pre_args(profile: GpuProfile, vaapi_device: str | None = None) -> list[str]:
+    """Args that must precede -i (hardware device initialisation)."""
+    if profile.api == "vaapi":
+        dev = vaapi_device or resolve_vaapi_device()
+        return ["-vaapi_device", dev]
+    if profile.api == "qsv":
+        return ["-init_hw_device", "qsv=hw"]
+    return []
+
+
+def encoder_filter_chain(profile: GpuProfile) -> list[str]:
+    """Filter args that upload software frames to the hardware surface
+    format (VAAPI encoders only accept hw frames; -vaapi_device makes
+    its device the default for hwupload)."""
+    if profile.api == "vaapi":
+        return ["-vf", "format=nv12,hwupload"]
+    return []
+
+
+def encoder_quality_args(api: str, encoder: str, crf: int, preset: int) -> list[str]:
+    """Constant-quality args for a hardware encoder. NVENC maps the CPU
+    preset tiers to p-presets; QSV uses very_fast/medium; VAAPI uses CQP
+    rate mode which has no preset knob."""
+    if api == "nvenc":
+        if preset <= 6:
+            p = "p7"
+        elif preset <= 8:
+            p = "p5"
+        else:
+            p = "p4"
+        return ["-preset", p, "-tune", "hq", "-rc", "vbr",
+                "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p",
+                "-g", "240"]
+    if api == "qsv":
+        p = "veryslow" if preset <= 6 else ("medium" if preset <= 8 else "very_fast")
+        return ["-preset", p, "-global_quality", str(crf),
+                "-pix_fmt", "yuv420p", "-g", "240"]
+    if api == "vaapi":
+        return ["-rc_mode", "CQP", "-qp", str(crf), "-g", "240"]
+    return []
+
+
 class SourceBuildWorker(QThread):
     """Builds VapourSynth and/or av1an from git to resolve ABI mismatches.
 
@@ -4546,11 +5694,14 @@ class SourceBuildWorker(QThread):
     build_done = Signal(bool, str)   # (success, detail)
 
     def __init__(self, build_vs: bool = True, build_av1an: bool = True,
-                 build_ffmpeg_iamf: bool = False):
+                 build_ffmpeg_iamf: bool = False, gpu_profile_key: str = ""):
         super().__init__()
         self.build_vs = build_vs
         self.build_av1an = build_av1an
         self.build_ffmpeg_iamf = build_ffmpeg_iamf
+        # v4.8.0: selected GPU capability profile — extends the dep tree
+        # with the vendor's build/runtime packages.
+        self.gpu_profile_key = gpu_profile_key
         self._stop = False
         # Private per-worker environment snapshot. Mutating os.environ is
         # process-global and leaks across threads/subsequent subprocesses;
@@ -4607,29 +5758,70 @@ class SourceBuildWorker(QThread):
 
     def run(self):
         try:
-            # ── Install build dependencies (may need one sudo prompt) ──
+            # ── v4.7.1: distro-aware dependency tree ──
+            # The rebuild must work on a bare system: detect missing
+            # tools/libraries and install them via the distro package
+            # manager (one privilege prompt via pkexec/sudo) BEFORE
+            # compiling anything.
             self.log_msg.emit("")
-            self.log_msg.emit("=== Installing build dependencies ===")
-            all_deps = [
-                "meson", "ninja", "gcc", "pkg-config", "git",
-                "nasm", "yasm", "cmake", "python", "make",
-            ]
-            need_rust = self.build_av1an and not shutil.which("cargo")
-            if need_rust:
-                all_deps.append("rust")
+            self.log_msg.emit("=== Generating dependency tree ===")
+            self._distro = detect_distro()
+            self.log_msg.emit(
+                f"  Distro: {self._distro.name} (family={self._distro.family})"
+            )
+            plan = build_dep_plan(self._distro, build_av1an=self.build_av1an)
 
-            # Only invoke sudo if at least one dep is missing
-            missing = [d for d in all_deps if not shutil.which(d)]
+            # v4.8.0: GPU-profile packages on top of the base toolchain.
+            gpu_profile = gpu_profile_by_key(self.gpu_profile_key)
+            if gpu_profile is not None and gpu_profile.api != "none":
+                gpu_pkgs = gpu_dep_packages(gpu_profile.api, self._distro.family)
+                if gpu_pkgs:
+                    self.log_msg.emit(
+                        f"  GPU profile {gpu_profile.key} ({gpu_profile.api}): "
+                        f"+{len(gpu_pkgs)} package(s)"
+                    )
+                    plan.packages.extend(p for p in gpu_pkgs
+                                         if p not in plan.packages)
+
+            missing = self._missing_build_tools()
+            zimg_ok = self._pkgconfig_exists("zimg")
+            if zimg_ok:
+                self.log_msg.emit("  OK: zimg (VapourSynth dependency)")
+            else:
+                missing.append("zimg (library, via pkg-config)")
+            if self.build_av1an and not shutil.which("cargo"):
+                missing.append("cargo (rust)")
+
             if missing:
-                self.log_msg.emit(f"  Missing: {', '.join(missing)} — installing via pacman")
-                rc, _ = self._sudo_cmd(
-                    ["pacman", "-S", "--needed", "--noconfirm"] + all_deps,
-                    timeout=300, label="pacman build-deps",
-                )
-                if rc != 0:
-                    self.log_msg.emit("  (some deps may already be installed — continuing)")
+                self.log_msg.emit(f"  Missing: {', '.join(missing)}")
+                if plan.install_cmd:
+                    self.log_msg.emit(
+                        f"  Installing {len(plan.packages)} package(s) via "
+                        f"{plan.install_cmd[0]} (privilege prompt possible)..."
+                    )
+                    rc, _ = self._sudo_cmd(
+                        plan.install_cmd + plan.packages,
+                        timeout=900, label=f"{plan.install_cmd[0]} build-deps",
+                    )
+                    if rc != 0:
+                        self.log_msg.emit(
+                            "  (install reported an error — continuing; "
+                            "some packages may already be present)"
+                        )
+                else:
+                    self.log_msg.emit(f"  {plan.manual_note}")
             else:
                 self.log_msg.emit("  All build dependencies already installed.")
+
+            # Re-verify the critical tools after install.
+            still_missing = self._missing_build_tools()
+            if still_missing:
+                self.log_msg.emit(
+                    f"  FATAL: still missing after install: {', '.join(still_missing)}. "
+                    f"Install them manually and press REBUILD again."
+                )
+                self.build_done.emit(False, f"missing build tools: {still_missing}")
+                return
 
             # Ensure cargo is in PATH after potential install.
             # NOTE: /root/.cargo/bin was dropped (OTC-015/v3-08) — root's
@@ -4651,6 +5843,9 @@ class SourceBuildWorker(QThread):
             # ── Build & install VapourSynth to ~/.local (NO sudo needed) ──
             if self.build_vs:
                 self._build_vapoursynth()
+                # v4.7.1: BestSource right after VS, compiled against the
+                # fresh VS headers — gives av1an a fast chunk method.
+                self._build_bestsource()
 
             # ── Build av1an to ~/.cargo/bin (NO sudo needed) ──
             if self.build_av1an:
@@ -4661,12 +5856,25 @@ class SourceBuildWorker(QThread):
                 self._build_libiamf()
                 self._build_ffmpeg_with_iamf()
 
-            # ── Ensure LD_LIBRARY_PATH includes local VS libs ──
+            # ── Ensure the runtime env can find the fresh VS stack ──
+            # The git VapourSynth installs self-contained into the user
+            # site-packages (module + libs + plugins). av1an dlopens
+            # libvapoursynth-script from there, so both LD_LIBRARY_PATH
+            # and PYTHONPATH must include it.
             local_lib = str(Path.home() / ".local" / "lib")
             existing_ld = self._build_env.get("LD_LIBRARY_PATH", "")
             if local_lib not in existing_ld:
                 self._extend_env("LD_LIBRARY_PATH", local_lib, prepend=True)
-                self.log_msg.emit(f"  Set LD_LIBRARY_PATH to include {local_lib}")
+            user_site = self._vs_user_site()
+            if user_site and (user_site / "vapoursynth" / "libvsscript.so").exists():
+                vs_dir = str(user_site / "vapoursynth")
+                if vs_dir not in self._build_env.get("LD_LIBRARY_PATH", ""):
+                    self._extend_env("LD_LIBRARY_PATH", vs_dir, prepend=True)
+                if str(user_site) not in self._build_env.get("PYTHONPATH", ""):
+                    self._extend_env("PYTHONPATH", str(user_site), prepend=True)
+                self.log_msg.emit(
+                    f"  Runtime env: LD_LIBRARY_PATH/PYTHONPATH include {vs_dir}"
+                )
 
             self.log_msg.emit("")
             self.log_msg.emit("=== Source build complete ===")
@@ -4682,6 +5890,127 @@ class SourceBuildWorker(QThread):
             # Exception(...)` call sites — out of scope for ERR01-C pass.
             self.log_msg.emit(f"BUILD FAILED: {e}")
             self.build_done.emit(False, str(e))
+
+    def _missing_build_tools(self) -> list[str]:
+        """Binaries from BUILD_TOOL_ALIASES that are not on PATH."""
+        missing = []
+        for label, candidates in BUILD_TOOL_ALIASES.items():
+            if not any(shutil.which(c) for c in candidates):
+                missing.append(label)
+        return missing
+
+    def _pkgconfig_exists(self, name: str) -> bool:
+        rc, _ = self._run_cmd(
+            ["pkg-config", "--exists", name],
+            timeout=10, label=f"pkg-config {name}",
+        )
+        return rc == 0
+
+    def _vs_user_site(self) -> Path | None:
+        """The user site-packages dir of the system python3 — where the
+        VapourSynth git install places its self-contained stack (module,
+        libs, headers, plugins/)."""
+        rc, out = self._run_cmd(
+            ["python3", "-m", "site", "--user-site"],
+            timeout=15, label="python3 -m site --user-site",
+        )
+        if rc == 0 and out.strip():
+            return Path(out.strip().splitlines()[-1])
+        return None
+
+    def _build_bestsource(self):
+        """Clone and build the BestSource VapourSynth plugin from git.
+
+        BestSource gives av1an a fast, frame-accurate chunk source — the
+        difference between 'select' (quadratic decoding, minutes per
+        file) and normal chunk-parallel speed. Compiled against the
+        vapoursynth headers of the JUST-INSTALLED git VS (via
+        PYTHONPATH/PKG_CONFIG_PATH), so the plugin ABI always matches
+        the VS that av1an will load. Requires the repo's libp2p
+        submodule (initialized here).
+        """
+        self.log_msg.emit("")
+        self.log_msg.emit("=== Building BestSource plugin from git ===")
+        self.log_msg.emit("  Source: https://github.com/vapoursynth/bestsource")
+
+        build_dir = Path("/tmp/bestsource-git-build")
+        if build_dir.exists():
+            shutil.rmtree(build_dir, ignore_errors=True)
+
+        rc, out = self._run_cmd(
+            ["git", "clone", "--depth", "1",
+             "https://github.com/vapoursynth/bestsource.git",
+             str(build_dir)],
+            timeout=120, label="git clone bestsource",
+        )
+        if rc != 0:
+            raise Exception(f"git clone bestsource failed: {out[-300:]}")
+
+        # libp2p is a required submodule (R9+ builds source from it).
+        rc, out = self._run_cmd(
+            ["git", "submodule", "update", "--init", "--depth", "1"],
+            cwd=str(build_dir), timeout=120, label="git submodule update",
+        )
+        if rc != 0:
+            raise Exception(f"bestsource submodule init failed: {out[-300:]}")
+
+        # Point meson/pkg-config at the freshly built VS stack.
+        user_site = self._vs_user_site()
+        if user_site and (user_site / "vapoursynth").is_dir():
+            self._extend_env("PYTHONPATH", str(user_site), prepend=True)
+            self._extend_env("PKG_CONFIG_PATH",
+                             str(user_site / "vapoursynth" / "pkgconfig"),
+                             prepend=True)
+            self._extend_env("LD_LIBRARY_PATH",
+                             str(user_site / "vapoursynth"), prepend=True)
+        else:
+            self.log_msg.emit(
+                "  NOTE: git VapourSynth install not found in user "
+                "site-packages — building against system vapoursynth."
+            )
+
+        self.log_msg.emit("  Configuring with meson (--prefix=~/.local)...")
+        rc, out = self._run_cmd(
+            ["meson", "setup", "build",
+             f"--prefix={Path.home() / '.local'}", "--libdir=lib"],
+            cwd=str(build_dir), timeout=180, label="meson setup bestsource",
+        )
+        if rc != 0:
+            raise Exception(f"bestsource meson setup failed: {out[-500:]}")
+
+        self.log_msg.emit("  Compiling BestSource (a minute or two)...")
+        rc, out = self._run_cmd(
+            ["ninja", "-C", "build", "-j", str(max(1, os.cpu_count() or 2))],
+            cwd=str(build_dir), timeout=600, label="ninja bestsource",
+        )
+        if rc != 0:
+            raise Exception(f"bestsource build failed: {out[-500:]}")
+
+        rc, out = self._run_cmd(
+            ["ninja", "-C", "build", "install"],
+            cwd=str(build_dir), timeout=120, label="ninja install bestsource",
+        )
+        if rc != 0:
+            raise Exception(f"bestsource install failed: {out[-500:]}")
+
+        plugin = None
+        if user_site:
+            candidate = user_site / "vapoursynth" / "plugins" / "libbestsource.so"
+            if candidate.exists():
+                plugin = candidate
+        if plugin:
+            self.log_msg.emit(f"  BestSource plugin installed: {plugin}")
+            self.log_msg.emit(
+                "  av1an will now auto-select the fast 'bestsource' chunk "
+                "method (restart the app so the probe sees it)."
+            )
+        else:
+            self.log_msg.emit(
+                "  WARNING: libbestsource.so not found at the expected "
+                "user-site path — check the meson install log above."
+            )
+
+        shutil.rmtree(build_dir, ignore_errors=True)
 
     def _build_vapoursynth(self):
         """Clone, build, and install VapourSynth to ~/.local/ (no sudo needed)."""
@@ -5374,7 +6703,13 @@ class OpenCodecMaster(QMainWindow):
         self.setWindowTitle("OpenTranscode — dcos.net")
         self.resize(1100, 920)
         self.worker: EncoderWorker | None = None
-        self.env: EnvProbe | None = None
+        # v4.7.0: hybrid (GPU + CPU lanes) bookkeeping. *workers* holds
+        # every active lane; _hybrid_pending/_hybrid_totals aggregate the
+        # per-lane finished_queue signals into one summary.
+        self.workers: list[EncoderWorker] = []
+        self._hybrid_pending = 0
+        self._hybrid_totals = [0, 0]
+
         self._pending_deletes: list[Path] = []
 
         self._apply_mmd3_theme()
@@ -5589,6 +6924,88 @@ class OpenCodecMaster(QMainWindow):
             "which is more reliable across distros."
         )
         opt_row.addWidget(self.av1an_check)
+
+        # v4.6.0: ENGINE selector — Auto (GPU if available) / GPU / CPU.
+        # Auto uses the NVENC hardware encoder for the selected codec
+        # family when the environment probe's live encode test proved it
+        # works (av1 → av1_nvenc on RTX 40+, hevc → hevc_nvenc on every
+        # NVENC generation); otherwise it stays on the CPU encoders. GPU
+        # mode runs through the single-pass ffmpeg path — av1an cannot
+        # drive NVENC, and one NVENC process outruns chunk-parallel CPU
+        # workers anyway.
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems([
+            "Engine: Auto (GPU if available)",
+            "Engine: GPU (NVENC)",
+            "Engine: CPU",
+            "Engine: Hybrid (GPU + CPU)",
+        ])
+        self.engine_combo.setToolTip(
+            "Video encode engine.\n\n"
+            "Auto — use the NVENC GPU encoder when the selected codec\n"
+            "   family has one AND a live encode test proved it works on\n"
+            "   this system; fall back to CPU otherwise (default).\n"
+            "GPU — force NVENC (hevc_nvenc / av1_nvenc); falls back to\n"
+            "   CPU with a log message when unavailable. GPU encodes run\n"
+            "   via single-pass ffmpeg (av1an chunking is not used).\n"
+            "CPU — force the software encoders (SVT-AV1 / VP9 / x265).\n"
+            "Hybrid — run BOTH at once: the queue is split between a\n"
+            "   GPU lane and a CPU lane (balanced by file size), so the\n"
+            "   CPU cores are not idle while NVENC encodes. With av1an\n"
+            "   enabled the CPU lane uses chunk-parallel too. GPU-lane\n"
+            "   files get NVENC quality; CPU-lane files get software-\n"
+            "   encoder quality. Needs 2+ encodable files.\n"
+        )
+        self.engine_combo.setFixedHeight(24)
+        # v4.7.1: self.env is None (or absent) until _probe_and_init
+        # runs AFTER _build_ui — the pre-select must not touch it here.
+        _engine_flags = getattr(getattr(self, "env", None), "av1an_flags", None) or {}
+        _engine_pref = _engine_flags.get("engine")
+        _engine_index = {"auto": 0, "gpu": 1, "cpu": 2, "hybrid": 3}
+        self.engine_combo.setCurrentIndex(_engine_index.get(_engine_pref, 0))
+        # v4.8.0: GPU capability-profile dropdown. Entries combine whole
+        # card generations (same silicon = same encoding behaviour) and
+        # include data-center + crypto-era oddballs. "Auto-detect" uses
+        # the probe's name match; a specific profile forces the API even
+        # when auto-match fails. The rebuild-from-git dep tree extends
+        # with the selected profile's packages.
+        self.gpu_combo = QComboBox()
+        self.gpu_combo.addItem("GPU: Auto-detect")
+        for _gp in GPU_PROFILES:
+            self.gpu_combo.addItem(f"GPU: {_gp.label}")
+        self.gpu_combo.setToolTip(
+            "Hardware encoder capability class.\n"
+            "Auto-detect matches your card via nvidia-smi/lspci and the\n"
+            "live encode probe decides what actually works. Forcing a\n"
+            "profile also extends the REBUILD FROM GIT dependency tree\n"
+            "with that GPU's packages (nv-codec-headers / VAAPI / QSV)."
+        )
+        self.gpu_combo.setFixedHeight(24)
+        _gpu_pref = _engine_flags.get("gpu_profile")
+        _gpu_keys = ["auto"] + [_gp.key for _gp in GPU_PROFILES]
+        self.gpu_combo.setCurrentIndex(
+            _gpu_keys.index(_gpu_pref) if _gpu_pref in _gpu_keys else 0
+        )
+        self.gpu_combo.currentIndexChanged.connect(self._on_gpu_profile_changed)
+        # v4.8.1: ENGINE = CPU makes the GPU choice inert — grey it out.
+        # The "None (CPU-only encode)" entry stays available for users
+        # who have a GPU in the box but don't want encoding on it.
+        self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        self._update_gpu_combo_state()
+        _gpu_lay = QVBoxLayout()
+        _gpu_lay.setSpacing(1)
+        _gpu_lbl = QLabel("GPU")
+        _gpu_lbl.setStyleSheet("color: #666; font-size: 7px; letter-spacing: 1px;")
+        _gpu_lay.addWidget(_gpu_lbl)
+        _gpu_lay.addWidget(self.gpu_combo)
+        opt_row.addLayout(_gpu_lay)
+        _engine_lay = QVBoxLayout()
+        _engine_lay.setSpacing(1)
+        _engine_lbl = QLabel("ENGINE")
+        _engine_lbl.setStyleSheet("color: #666; font-size: 7px; letter-spacing: 1px;")
+        _engine_lay.addWidget(_engine_lbl)
+        _engine_lay.addWidget(self.engine_combo)
+        opt_row.addLayout(_engine_lay)
         root.addLayout(opt_row)
 
         # ── Log + Knobs: horizontal split ──
@@ -5637,12 +7054,18 @@ class OpenCodecMaster(QMainWindow):
         self.btn_rebuild.setObjectName("btnRebuild")
         self.btn_rebuild.setFixedHeight(40)
         self.btn_rebuild.setToolTip(
-            "Compile VapourSynth + av1an from git source.\n"
+            "Compile VapourSynth + av1an + BestSource from git source.\n"
             "Resolves ABI/version mismatch when package managers\n"
-            "install incompatible versions."
+            "install incompatible versions. ALWAYS available — even on a\n"
+            "bare system: it first generates its own dependency tree\n"
+            "(installs missing build tools + zimg via the distro package\n"
+            "manager, one privilege prompt) and then builds everything\n"
+            "into ~/.local / ~/.cargo (no system changes)."
         )
         self.btn_rebuild.clicked.connect(self._manual_rebuild)
-        self.btn_rebuild.setEnabled(False)
+        # v4.7.1: ALWAYS usable — the build generates its own dependency
+        # tree, so it must not depend on a successful probe (a failed
+        # probe is exactly when you need it).
         btn_lay.addWidget(self.btn_rebuild)
 
         self.btn_about = QPushButton("  ?  ABOUT / LICENSES")
@@ -6296,7 +7719,28 @@ class OpenCodecMaster(QMainWindow):
         selected_codec = VIDEO_CODECS[codec_idx]
         self._log(f"Codec: {selected_codec.label} (av1an encoder: {selected_codec.av1an_encoder})")
 
-        self.worker = EncoderWorker(
+        # v4.6.0: read the ENGINE selector and surface the resolved engine
+        # before the queue starts. The worker re-resolves against the same
+        # probe data; this line tells the user what is about to happen.
+        engine_sel = ("auto", "gpu", "cpu", "hybrid")[self.engine_combo.currentIndex()] \
+
+        if hasattr(self, "engine_combo"):
+            # Always write UI state so the worker's env fallback stays in
+            # sync when the user flips the combo between runs.
+            self.env.av1an_flags["engine"] = engine_sel
+        gpu_preview, gpu_api = resolve_gpu_encoder(engine_sel, selected_codec, self.env)
+        if gpu_preview:
+            self._log(f"Engine: GPU — {gpu_preview} ({gpu_api} hardware encode)")
+        elif engine_sel == "gpu":
+            gpu_enc = selected_codec.gpu_encoder or "(none for this codec)"
+            self._log(f"Engine: GPU requested but {gpu_enc} unavailable — will use CPU.")
+        elif engine_sel == "hybrid":
+            self._log("Engine: hybrid — GPU lane + CPU lane concurrently (splits the queue by size).")
+
+
+        # v4.7.0: kwargs shared by every lane of the queue (single
+        # worker, or the GPU + CPU lanes in hybrid mode).
+        common = dict(
             in_dir=in_dir,
             out_dir=out_dir,
             video_codec=selected_codec,
@@ -6305,23 +7749,159 @@ class OpenCodecMaster(QMainWindow):
             crf=self.crf_knob.intValue(),
             preset_label=self.preset_combo.currentText(),
             delete_source=self.del_check.isChecked(),
-            env=self.env,
             extensions=self._parse_extensions(),
             resolution=self._get_current_resolution(),
             audio_level_db=self.vol_knob.value(),
-            use_ffmpeg_fallback=use_ffmpeg_fallback,
             subtitle_lang=SUBTITLE_OPTIONS[self.subs_combo.currentIndex()][1],
             force=self.force_check.isChecked(),  # v5-01
         )
-        self.worker.log_msg.connect(self._log)
-        self.worker.progress_msg.connect(self._on_progress)
-        self.worker.finished_queue.connect(self._on_finished)
+
+        # ── v4.7.0: hybrid (GPU + CPU lanes run concurrently) ──
+        if engine_sel == "hybrid":
+            if self._start_hybrid(common, use_ffmpeg_fallback, use_av1an):
+                self.btn_run.setEnabled(False)
+                self.btn_run.setText("RUNNING...")
+                self.btn_stop.setEnabled(True)
+                self.btn_rebuild.setEnabled(False)
+                for w in self.workers:
+                    w.start()
+                return
+            self._log("Hybrid unavailable — falling back to a single CPU queue.")
+            engine_sel = "cpu"
+
+        self.worker = EncoderWorker(
+            **common,
+            env=self.env,
+            use_ffmpeg_fallback=use_ffmpeg_fallback,
+            engine=engine_sel,  # v4.6.0: Auto/GPU/CPU engine selector
+        )
+        self._set_workers([self.worker])
 
         self.btn_run.setEnabled(False)
         self.btn_run.setText("RUNNING...")
         self.btn_stop.setEnabled(True)
         self.btn_rebuild.setEnabled(False)
         self.worker.start()
+
+    @Slot()
+    def _on_engine_changed(self, index: int):
+        """v4.8.1: ENGINE = CPU disables the GPU dropdown (the choice
+        would have no effect); every other engine keeps it live."""
+        self._update_gpu_combo_state()
+
+    def _update_gpu_combo_state(self):
+        cpu_only = self.engine_combo.currentIndex() == 2  # "Engine: CPU"
+        self.gpu_combo.setEnabled(not cpu_only)
+        self.gpu_combo.setToolTip(
+            "ENGINE is CPU — the GPU choice has no effect."
+            if cpu_only else
+            "Hardware encoder capability class.\n"
+            "Auto-detect matches your card via nvidia-smi/lspci and the\n"
+            "live encode probe decides what actually works. Forcing a\n"
+            "profile also extends the REBUILD FROM GIT dependency tree\n"
+            "with that GPU's packages (nv-codec-headers / VAAPI / QSV).\n"
+            "'None (CPU-only encode)' opts out even when a GPU exists."
+        )
+
+    @Slot()
+    def _on_gpu_profile_changed(self, index: int):
+        """v4.8.0: persist the GPU capability-profile selection so both
+        the engine resolution and the rebuild dep tree pick it up."""
+        if not getattr(self, "env", None):
+            return  # UI build phase — env probe hasn't run yet
+        if index <= 0:
+            self.env.av1an_flags["gpu_profile"] = "auto"
+            return
+        self.env.av1an_flags["gpu_profile"] = GPU_PROFILES[index - 1].key
+        self._log(f"GPU profile: {GPU_PROFILES[index - 1].key}")
+
+    def _set_workers(self, workers: list) -> None:
+        """v4.7.0: register the active lane worker(s) and wire their
+        signals. STOP iterates every lane; _on_finished aggregates the
+        per-lane summaries into one."""
+        self.workers = list(workers)
+        self._hybrid_pending = len(self.workers)
+        self._hybrid_totals = [0, 0]
+        for w in self.workers:
+            w.log_msg.connect(self._log)
+            w.progress_msg.connect(self._on_progress)
+            w.finished_queue.connect(self._on_finished)
+
+    def _start_hybrid(self, common: dict, use_ffmpeg_fallback: bool,
+                      use_av1an: bool) -> bool:
+        """v4.7.0: split the queue between a GPU lane (NVENC) and a CPU
+        lane (software encoders, or av1an chunk-parallel when opted in —
+        so NVENC + chunk workers + software can all run at once).
+
+        Constructs both workers on success and returns True. Returns
+        False (with a logged reason) when hybrid cannot apply; the caller
+        falls back to a single-lane queue.
+        """
+        import copy as _copy
+        import dataclasses as _dc
+
+        gpu_enc, _gpu_api = resolve_gpu_encoder("gpu", common["video_codec"], self.env)
+        if not gpu_enc:
+            self._log("Hybrid: no functional NVENC encoder for this codec family.")
+            return False
+
+        files = scan_input_files(common["in_dir"], common["extensions"])
+        if len(files) < 2:
+            self._log("Hybrid: fewer than 2 encodable files — one lane is faster than scheduling.")
+            return False
+
+        sizes: dict = {}
+        for f in files:
+            try:
+                sizes[f] = f.stat().st_size
+            except OSError:
+                pass
+        plan = plan_hybrid(
+            files, gpu_enc, True, self.env.cpu.logical_threads, sizes=sizes,
+        )
+        if plan is None or not plan.gpu_files or not plan.cpu_files:
+            self._log("Hybrid: size split degenerated to one lane — single lane is faster.")
+            return False
+
+        self._log(
+            f"HYBRID: GPU lane = {len(plan.gpu_files)} file(s) via {gpu_enc} | "
+            f"CPU lane = {len(plan.cpu_files)} file(s) "
+            f"(budget {plan.cpu_budget_threads} threads"
+            f"{', av1an chunk-parallel' if use_av1an else ''})"
+        )
+        self._log(
+            "  Note: lanes use different encoders — GPU-lane files get NVENC "
+            "quality, CPU-lane files get software-encoder quality."
+        )
+
+        # CPU lane budget: hold back threads for the GPU lane's
+        # decode/scale/mux processes, then let the lane self-budget its
+        # av1an workers / ffmpeg threads from the reduced topology.
+        cpu_env = _copy.copy(self.env)
+        cpu_env.cpu = _dc.replace(
+            self.env.cpu, logical_threads=plan.cpu_budget_threads
+        )
+
+        gpu_worker = EncoderWorker(
+            **common,
+            env=self.env,
+            use_ffmpeg_fallback=True,   # GPU runs via single-pass ffmpeg
+            engine="gpu",
+            file_subset=plan.gpu_files,
+            lane="gpu",
+        )
+        cpu_worker = EncoderWorker(
+            **common,
+            env=cpu_env,
+            use_ffmpeg_fallback=use_ffmpeg_fallback,
+            engine="cpu",
+            file_subset=plan.cpu_files,
+            lane="cpu",
+            ffmpeg_threads=plan.cpu_budget_threads,
+        )
+        self.worker = cpu_worker  # primary handle (back-compat)
+        self._set_workers([gpu_worker, cpu_worker])
+        return True
 
     def _handle_vs_incompat(self) -> bool:
         """Handle detected VSScript ABI incompatibility.
@@ -6441,7 +8021,9 @@ class OpenCodecMaster(QMainWindow):
         self._build_worker = SourceBuildWorker(
             build_vs=build_vs, build_av1an=build_av1an,
             build_ffmpeg_iamf=build_ffmpeg_iamf,
+            gpu_profile_key=self.env.av1an_flags.get("gpu_profile", "auto"),
         )
+
         self._build_worker.log_msg.connect(self._log)
         self._build_worker.build_done.connect(self._on_build_done)
         self._build_worker.start()
@@ -6582,6 +8164,21 @@ class OpenCodecMaster(QMainWindow):
 
     @Slot(int, int)
     def _on_finished(self, ok: int, fail: int):
+        # v4.7.0: hybrid lanes finish independently — aggregate the
+        # per-lane summaries and only finalize when the LAST lane exits.
+        if len(self.workers) > 1:
+            self._hybrid_totals[0] += ok
+            self._hybrid_totals[1] += fail
+            self._hybrid_pending -= 1
+            if self._hybrid_pending > 0:
+                self._log(
+                    f"Lane done — {ok} ok, {fail} failed. "
+                    f"Waiting for the other lane..."
+                )
+                return
+            ok, fail = self._hybrid_totals
+            self._hybrid_totals = [0, 0]
+
         self.btn_run.setEnabled(True)
         self.btn_run.setText("START PROCESSING")
         self.btn_stop.setEnabled(False)
@@ -6594,10 +8191,13 @@ class OpenCodecMaster(QMainWindow):
 
     @Slot()
     def _stop_process(self):
-        if self.worker and self.worker.isRunning():
+        if any(w.isRunning() for w in self.workers):
             self._log("STOP: Exiting queue after current file finishes...")
-            self.worker.stop()
+            for w in self.workers:
+                w.stop()
             self.btn_stop.setEnabled(False)
+
+
 
 
 # ──────────────────────────────────────────────

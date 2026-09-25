@@ -23,7 +23,7 @@ Or import in code:
 
 from __future__ import annotations
 
-__version__ = "4.5.0"
+__version__ = "4.8.1"
 __author__ = "Jeremy Anderson - dcos.net"
 __license__ = "AGPL-3.0"
 
@@ -52,7 +52,9 @@ def launch_gui(argv: list[str] | None = None, force: bool = False,
                verbose: bool = False,
                skip_existing: bool = True,
                timeout: int = 86400,
-               inline_scale: bool = False) -> int:
+               inline_scale: bool = False,
+               engine: str = "auto",
+               gpu_profile: str = "auto") -> int:
     """Launch the OpenTranscode GUI.
 
     Thin wrapper around ``opentranscode.ui_window.launch_gui``; imported
@@ -101,11 +103,18 @@ def launch_gui(argv: list[str] | None = None, force: bool = False,
             error (rc=234)" disk-exhaustion messages. Default False —
             the intermediate path is more robust on older av1an/
             VapourSynth builds. Pre-checks the "Inline scale" UI checkbox.
+        engine: Video encode engine (v4.6.0). "auto" (default) uses the
+            NVENC GPU encoder when the selected codec family has one and
+            the live encode test proved it works; "gpu" forces NVENC;
+            "cpu" forces the software encoders; "hybrid" (v4.7.0) splits
+            the queue between a GPU lane and a CPU lane running
+            concurrently. Pre-selects the ENGINE combo in the UI.
     """
     from .ui_window import launch_gui as _launch
     return _launch(
         argv, force=force, chunk_method=chunk_method,
         max_workers=max_workers, threads_per_worker=threads_per_worker,
         use_av1an=use_av1an, verbose=verbose, skip_existing=skip_existing,
-        timeout=timeout, inline_scale=inline_scale,
+        timeout=timeout, inline_scale=inline_scale, engine=engine,
+        gpu_profile=gpu_profile,
     )

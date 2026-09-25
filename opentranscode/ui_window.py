@@ -36,7 +36,8 @@ from .codec_profiles import (
     ResolutionProfile,
     ffmpeg_lib_key_for,
 )
-from .encoder_worker import EncoderWorker
+from .encoder_worker import EncoderWorker, resolve_gpu_encoder
+from .gpu_profiles import GPU_PROFILES
 from .env_probe import (
     EnvProbe,
     _av1an_vsscript_smoke_test,
@@ -59,6 +60,12 @@ class OpenCodecMaster(QMainWindow):
         self.setWindowTitle("OpenTranscode — dcos.net")
         self.resize(1100, 920)
         self.worker: EncoderWorker | None = None
+        # v4.7.0: hybrid (GPU + CPU lanes) bookkeeping. *workers* holds
+        # every active lane; _hybrid_pending/_hybrid_totals aggregate the
+        # per-lane finished_queue signals into one summary.
+        self.workers: list[EncoderWorker] = []
+        self._hybrid_pending = 0
+        self._hybrid_totals = [0, 0]
         self.env: EnvProbe | None = None
         self._pending_deletes: list[Path] = []
 
@@ -300,6 +307,90 @@ class OpenCodecMaster(QMainWindow):
             "Default OFF for compatibility."
         )
         opt_row.addWidget(self.inline_scale_check)
+
+        # v4.6.0: ENGINE selector — Auto (GPU if available) / GPU / CPU.
+        # Auto uses the NVENC hardware encoder for the selected codec
+        # family when the environment probe's live encode test proved it
+        # works (av1 → av1_nvenc on RTX 40+, hevc → hevc_nvenc on every
+        # NVENC generation); otherwise it stays on the CPU encoders. GPU
+        # mode runs through the single-pass ffmpeg path — av1an cannot
+        # drive NVENC, and one NVENC process outruns chunk-parallel CPU
+        # workers anyway.
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems([
+            "Engine: Auto (GPU if available)",
+            "Engine: GPU (NVENC)",
+            "Engine: CPU",
+            "Engine: Hybrid (GPU + CPU)",
+        ])
+        self.engine_combo.setToolTip(
+            "Video encode engine.\n\n"
+            "Auto — use the NVENC GPU encoder when the selected codec\n"
+            "   family has one AND a live encode test proved it works on\n"
+            "   this system; fall back to CPU otherwise (default).\n"
+            "GPU — force NVENC (hevc_nvenc / av1_nvenc); falls back to\n"
+            "   CPU with a log message when unavailable. GPU encodes run\n"
+            "   via single-pass ffmpeg (av1an chunking is not used).\n"
+            "CPU — force the software encoders (SVT-AV1 / VP9 / x265).\n"
+            "Hybrid — run BOTH at once: the queue is split between a\n"
+            "   GPU lane and a CPU lane (balanced by file size), so the\n"
+            "   CPU cores are not idle while NVENC encodes. With av1an\n"
+            "   enabled the CPU lane uses chunk-parallel too. GPU-lane\n"
+            "   files get NVENC quality; CPU-lane files get software-\n"
+            "   encoder quality. Needs 2+ encodable files.\n"
+        )
+        self.engine_combo.setFixedHeight(24)
+        # v4.7.1: self.env is None (or absent) until _probe_and_init
+        # runs AFTER _build_ui — the pre-select must not touch it here.
+        _engine_flags = getattr(getattr(self, "env", None), "av1an_flags", None) or {}
+        _engine_pref = _engine_flags.get("engine")
+        _engine_index = {"auto": 0, "gpu": 1, "cpu": 2, "hybrid": 3}
+        self.engine_combo.setCurrentIndex(_engine_index.get(_engine_pref, 0))
+
+        # v4.8.0: GPU capability-profile dropdown. Entries combine whole
+        # card generations (same silicon = same encoding behaviour) and
+        # include data-center + crypto-era oddballs. "Auto-detect" uses
+        # the probe's name match; a specific profile forces the API even
+        # when auto-match fails. The rebuild-from-git dep tree extends
+        # with the selected profile's packages.
+        from .gpu_profiles import GPU_PROFILES as _GPU_PROFILES
+        self.gpu_combo = QComboBox()
+        self.gpu_combo.addItem("GPU: Auto-detect")
+        for _gp in _GPU_PROFILES:
+            self.gpu_combo.addItem(f"GPU: {_gp.label}")
+        self.gpu_combo.setToolTip(
+            "Hardware encoder capability class.\n"
+            "Auto-detect matches your card via nvidia-smi/lspci and the\n"
+            "live encode probe decides what actually works. Forcing a\n"
+            "profile also extends the REBUILD FROM GIT dependency tree\n"
+            "with that GPU's packages (nv-codec-headers / VAAPI / QSV)."
+        )
+        self.gpu_combo.setFixedHeight(24)
+        _gpu_pref = _engine_flags.get("gpu_profile")
+        _gpu_keys = ["auto"] + [_gp.key for _gp in _GPU_PROFILES]
+        self.gpu_combo.setCurrentIndex(
+            _gpu_keys.index(_gpu_pref) if _gpu_pref in _gpu_keys else 0
+        )
+        self.gpu_combo.currentIndexChanged.connect(self._on_gpu_profile_changed)
+        # v4.8.1: ENGINE = CPU makes the GPU choice inert — grey it out.
+        # The "None (CPU-only encode)" entry stays available for users
+        # who have a GPU in the box but don't want encoding on it.
+        self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        self._update_gpu_combo_state()
+        _gpu_lay = QVBoxLayout()
+        _gpu_lay.setSpacing(1)
+        _gpu_lbl = QLabel("GPU")
+        _gpu_lbl.setStyleSheet("color: #666; font-size: 7px; letter-spacing: 1px;")
+        _gpu_lay.addWidget(_gpu_lbl)
+        _gpu_lay.addWidget(self.gpu_combo)
+        opt_row.addLayout(_gpu_lay)
+        _engine_lay = QVBoxLayout()
+        _engine_lay.setSpacing(1)
+        _engine_lbl = QLabel("ENGINE")
+        _engine_lbl.setStyleSheet("color: #666; font-size: 7px; letter-spacing: 1px;")
+        _engine_lay.addWidget(_engine_lbl)
+        _engine_lay.addWidget(self.engine_combo)
+        opt_row.addLayout(_engine_lay)
         root.addLayout(opt_row)
 
         # ── Log + Knobs: horizontal split ──
@@ -348,12 +439,18 @@ class OpenCodecMaster(QMainWindow):
         self.btn_rebuild.setObjectName("btnRebuild")
         self.btn_rebuild.setFixedHeight(40)
         self.btn_rebuild.setToolTip(
-            "Compile VapourSynth + av1an from git source.\n"
+            "Compile VapourSynth + av1an + BestSource from git source.\n"
             "Resolves ABI/version mismatch when package managers\n"
-            "install incompatible versions."
+            "install incompatible versions. ALWAYS available — even on a\n"
+            "bare system: it first generates its own dependency tree\n"
+            "(installs missing build tools + zimg via the distro package\n"
+            "manager, one privilege prompt) and then builds everything\n"
+            "into ~/.local / ~/.cargo (no system changes)."
         )
         self.btn_rebuild.clicked.connect(self._manual_rebuild)
-        self.btn_rebuild.setEnabled(False)
+        # v4.7.1: ALWAYS usable — the build generates its own dependency
+        # tree, so it must not depend on a successful probe (a failed
+        # probe is exactly when you need it).
         btn_lay.addWidget(self.btn_rebuild)
 
         self.btn_about = QPushButton("  ?  ABOUT / LICENSES")
@@ -997,6 +1094,26 @@ class OpenCodecMaster(QMainWindow):
         selected_codec = VIDEO_CODECS[codec_idx]
         self._log(f"Codec: {selected_codec.label} (av1an encoder: {selected_codec.av1an_encoder})")
 
+        # v4.6.0: read the ENGINE selector and surface the resolved engine
+        # before the queue starts. The worker re-resolves against the same
+        # probe data; this line tells the user what is about to happen.
+        engine_sel = ("auto", "gpu", "cpu", "hybrid")[self.engine_combo.currentIndex()] \
+            if hasattr(self, "engine_combo") else "auto"
+        if hasattr(self, "engine_combo"):
+            # Always write UI state (CLI --engine pre-selects the combo;
+            # unchecking round-trips the same way as the other toggles).
+            self.env.av1an_flags["engine"] = engine_sel
+        gpu_preview, gpu_api = resolve_gpu_encoder(engine_sel, selected_codec, self.env)
+        if gpu_preview:
+            self._log(f"Engine: GPU — {gpu_preview} ({gpu_api} hardware encode)")
+        elif engine_sel == "gpu":
+            gpu_enc = selected_codec.gpu_encoder or "(none for this codec)"
+            self._log(f"Engine: GPU requested but {gpu_enc} unavailable — will use CPU.")
+        elif engine_sel == "hybrid":
+            self._log("Engine: hybrid — GPU lane + CPU lane concurrently (splits the queue by size).")
+        else:
+            self._log("Engine: CPU (software encoders)")
+
         # v4.4.4: read the inline-scale checkbox into env.av1an_flags so
         # EncoderWorker.__init__'s fallback path picks it up (matches the
         # pattern used by --use-av1an, --verbose, --skip-existing, etc.).
@@ -1009,7 +1126,9 @@ class OpenCodecMaster(QMainWindow):
             if self.inline_scale_check.isChecked():
                 self._log("Inline scale: enabled (no intermediate file for scaling).")
 
-        self.worker = EncoderWorker(
+        # v4.7.0: kwargs shared by every lane of the queue (single
+        # worker, or the GPU + CPU lanes in hybrid mode).
+        common = dict(
             in_dir=in_dir,
             out_dir=out_dir,
             video_codec=selected_codec,
@@ -1018,23 +1137,163 @@ class OpenCodecMaster(QMainWindow):
             crf=self.crf_knob.intValue(),
             preset_label=self.preset_combo.currentText(),
             delete_source=self.del_check.isChecked(),
-            env=self.env,
             extensions=self._parse_extensions(),
             resolution=self._get_current_resolution(),
             audio_level_db=self.vol_knob.value(),
-            use_ffmpeg_fallback=use_ffmpeg_fallback,
             subtitle_lang=SUBTITLE_OPTIONS[self.subs_combo.currentIndex()][1],
             force=self.force_check.isChecked(),  # v5-01
         )
-        self.worker.log_msg.connect(self._log)
-        self.worker.progress_msg.connect(self._on_progress)
-        self.worker.finished_queue.connect(self._on_finished)
+
+        # ── v4.7.0: hybrid (GPU + CPU lanes run concurrently) ──
+        if engine_sel == "hybrid":
+            if self._start_hybrid(common, use_ffmpeg_fallback, use_av1an):
+                self.btn_run.setEnabled(False)
+                self.btn_run.setText("RUNNING...")
+                self.btn_stop.setEnabled(True)
+                self.btn_rebuild.setEnabled(False)
+                for w in self.workers:
+                    w.start()
+                return
+            self._log("Hybrid unavailable — falling back to a single CPU queue.")
+            engine_sel = "cpu"
+
+        self.worker = EncoderWorker(
+            **common,
+            env=self.env,
+            use_ffmpeg_fallback=use_ffmpeg_fallback,
+            engine=engine_sel,  # v4.6.0: Auto/GPU/CPU engine selector
+        )
+        self._set_workers([self.worker])
 
         self.btn_run.setEnabled(False)
         self.btn_run.setText("RUNNING...")
         self.btn_stop.setEnabled(True)
         self.btn_rebuild.setEnabled(False)
         self.worker.start()
+
+    @Slot()
+    def _on_engine_changed(self, index: int):
+        """v4.8.1: ENGINE = CPU disables the GPU dropdown (the choice
+        would have no effect); every other engine keeps it live."""
+        self._update_gpu_combo_state()
+
+    def _update_gpu_combo_state(self):
+        cpu_only = self.engine_combo.currentIndex() == 2  # "Engine: CPU"
+        self.gpu_combo.setEnabled(not cpu_only)
+        self.gpu_combo.setToolTip(
+            "ENGINE is CPU — the GPU choice has no effect."
+            if cpu_only else
+            "Hardware encoder capability class.\n"
+            "Auto-detect matches your card via nvidia-smi/lspci and the\n"
+            "live encode probe decides what actually works. Forcing a\n"
+            "profile also extends the REBUILD FROM GIT dependency tree\n"
+            "with that GPU's packages (nv-codec-headers / VAAPI / QSV).\n"
+            "'None (CPU-only encode)' opts out even when a GPU exists."
+        )
+
+    @Slot()
+    def _on_gpu_profile_changed(self, index: int):
+        """v4.8.0: persist the GPU capability-profile selection so both
+        the engine resolution and the rebuild dep tree pick it up."""
+        if not getattr(self, "env", None):
+            return  # UI build phase — env probe hasn't run yet
+        if index <= 0:
+            self.env.av1an_flags["gpu_profile"] = "auto"
+            return
+        from .gpu_profiles import GPU_PROFILES
+        self.env.av1an_flags["gpu_profile"] = GPU_PROFILES[index - 1].key
+        self._log(f"GPU profile: {GPU_PROFILES[index - 1].key}")
+
+    def _set_workers(self, workers: list) -> None:
+        """v4.7.0: register the active lane worker(s) and wire their
+        signals. STOP iterates every lane; _on_finished aggregates the
+        per-lane summaries into one."""
+        self.workers = list(workers)
+        self._hybrid_pending = len(self.workers)
+        self._hybrid_totals = [0, 0]
+        for w in self.workers:
+            w.log_msg.connect(self._log)
+            w.progress_msg.connect(self._on_progress)
+            w.finished_queue.connect(self._on_finished)
+
+    def _start_hybrid(self, common: dict, use_ffmpeg_fallback: bool,
+                      use_av1an: bool) -> bool:
+        """v4.7.0: split the queue between a GPU lane (NVENC) and a CPU
+        lane (software encoders, or av1an chunk-parallel when opted in —
+        so NVENC + chunk workers + software can all run at once).
+
+        Constructs both workers on success and returns True. Returns
+        False (with a logged reason) when hybrid cannot apply; the caller
+        falls back to a single-lane queue.
+        """
+        import copy as _copy
+        import dataclasses as _dc
+
+        from .encoder_worker import scan_input_files
+        from .hybrid_scheduler import plan_hybrid
+
+        gpu_enc, _gpu_api = resolve_gpu_encoder("gpu", common["video_codec"], self.env)
+        if not gpu_enc:
+            self._log("Hybrid: no functional NVENC encoder for this codec family.")
+            return False
+
+        files = scan_input_files(common["in_dir"], common["extensions"])
+        if len(files) < 2:
+            self._log("Hybrid: fewer than 2 encodable files — one lane is faster than scheduling.")
+            return False
+
+        sizes: dict = {}
+        for f in files:
+            try:
+                sizes[f] = f.stat().st_size
+            except OSError:
+                pass
+        plan = plan_hybrid(
+            files, gpu_enc, True, self.env.cpu.logical_threads, sizes=sizes,
+        )
+        if plan is None or not plan.gpu_files or not plan.cpu_files:
+            self._log("Hybrid: size split degenerated to one lane — single lane is faster.")
+            return False
+
+        self._log(
+            f"HYBRID: GPU lane = {len(plan.gpu_files)} file(s) via {gpu_enc} | "
+            f"CPU lane = {len(plan.cpu_files)} file(s) "
+            f"(budget {plan.cpu_budget_threads} threads"
+            f"{', av1an chunk-parallel' if use_av1an else ''})"
+        )
+        self._log(
+            "  Note: lanes use different encoders — GPU-lane files get NVENC "
+            "quality, CPU-lane files get software-encoder quality."
+        )
+
+        # CPU lane budget: hold back threads for the GPU lane's
+        # decode/scale/mux processes, then let the lane self-budget its
+        # av1an workers / ffmpeg threads from the reduced topology.
+        cpu_env = _copy.copy(self.env)
+        cpu_env.cpu = _dc.replace(
+            self.env.cpu, logical_threads=plan.cpu_budget_threads
+        )
+
+        gpu_worker = EncoderWorker(
+            **common,
+            env=self.env,
+            use_ffmpeg_fallback=True,   # GPU runs via single-pass ffmpeg
+            engine="gpu",
+            file_subset=plan.gpu_files,
+            lane="gpu",
+        )
+        cpu_worker = EncoderWorker(
+            **common,
+            env=cpu_env,
+            use_ffmpeg_fallback=use_ffmpeg_fallback,
+            engine="cpu",
+            file_subset=plan.cpu_files,
+            lane="cpu",
+            ffmpeg_threads=plan.cpu_budget_threads,
+        )
+        self.worker = cpu_worker  # primary handle (back-compat)
+        self._set_workers([gpu_worker, cpu_worker])
+        return True
 
     def _handle_vs_incompat(self) -> bool:
         """Handle detected VSScript ABI incompatibility.
@@ -1154,6 +1413,7 @@ class OpenCodecMaster(QMainWindow):
         self._build_worker = SourceBuildWorker(
             build_vs=build_vs, build_av1an=build_av1an,
             build_ffmpeg_iamf=build_ffmpeg_iamf,
+            gpu_profile_key=self.env.av1an_flags.get("gpu_profile", "auto"),
         )
         self._build_worker.log_msg.connect(self._log)
         self._build_worker.build_done.connect(self._on_build_done)
@@ -1295,6 +1555,21 @@ class OpenCodecMaster(QMainWindow):
 
     @Slot(int, int)
     def _on_finished(self, ok: int, fail: int):
+        # v4.7.0: hybrid lanes finish independently — aggregate the
+        # per-lane summaries and only finalize when the LAST lane exits.
+        if len(self.workers) > 1:
+            self._hybrid_totals[0] += ok
+            self._hybrid_totals[1] += fail
+            self._hybrid_pending -= 1
+            if self._hybrid_pending > 0:
+                self._log(
+                    f"Lane done — {ok} ok, {fail} failed. "
+                    f"Waiting for the other lane..."
+                )
+                return
+            ok, fail = self._hybrid_totals
+            self._hybrid_totals = [0, 0]
+
         self.btn_run.setEnabled(True)
         self.btn_run.setText("START PROCESSING")
         self.btn_stop.setEnabled(False)
@@ -1307,9 +1582,10 @@ class OpenCodecMaster(QMainWindow):
 
     @Slot()
     def _stop_process(self):
-        if self.worker and self.worker.isRunning():
+        if any(w.isRunning() for w in self.workers):
             self._log("STOP: Exiting queue after current file finishes...")
-            self.worker.stop()
+            for w in self.workers:
+                w.stop()
             self.btn_stop.setEnabled(False)
 
 
@@ -1327,7 +1603,9 @@ def launch_gui(argv: list[str] | None = None, force: bool = False,
                verbose: bool = False,
                skip_existing: bool = True,
                timeout: int = 86400,
-               inline_scale: bool = False) -> int:
+               inline_scale: bool = False,
+               engine: str = "auto",
+               gpu_profile: str = "auto") -> int:
     """Create the QApplication, show the OpenCodecMaster window, run the Qt event loop.
 
     This is the GUI entry point invoked by ``cli.main()`` when no
@@ -1435,5 +1713,34 @@ def launch_gui(argv: list[str] | None = None, force: bool = False,
         if inline_scale and hasattr(window, "inline_scale_check"):
             window.inline_scale_check.setChecked(True)
             window._log("Inline scale: enabled via --inline-scale (no intermediate for scaling).")
+        # v4.6.0: store --engine (auto|gpu|cpu). "auto" (default) uses the
+        # NVENC GPU encoder when the selected codec family has one and the
+        # live encode test passed. Pre-selects the ENGINE combo so the
+        # user sees the state; the combo is re-read at encode time, so the
+        # user can still change it per run.
+        if gpu_profile != "auto":
+            window.env.av1an_flags["gpu_profile"] = gpu_profile
+            if hasattr(window, "gpu_combo"):
+                _gpu_keys = ["auto"] + [gp.key for gp in GPU_PROFILES]
+                if gpu_profile in _gpu_keys:
+                    window.gpu_combo.setCurrentIndex(_gpu_keys.index(gpu_profile))
+            window._log(f"GPU profile: {gpu_profile} (via --gpu-profile).")
+        if engine in ("gpu", "cpu", "hybrid"):
+            window.env.av1an_flags["engine"] = engine
+            if hasattr(window, "engine_combo"):
+                window.engine_combo.setCurrentIndex(
+                    {"gpu": 1, "cpu": 2, "hybrid": 3}[engine]
+                )
+            window._log(f"Engine: {engine.upper()} (via --engine).")
+        else:
+            window.env.av1an_flags["engine"] = "auto"
+            gpu = getattr(window.env, "gpu", None)
+            if gpu is not None and gpu.has_gpu:
+                window._log(
+                    f"Engine: auto — GPU detected ({gpu.name or 'NVIDIA'}), "
+                    f"NVENC ready: {', '.join(gpu.usable_encoders)}."
+                )
+            else:
+                window._log("Engine: auto — no usable GPU encoder, CPU encoders will be used.")
     window.show()
     return sys.exit(app.exec())

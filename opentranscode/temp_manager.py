@@ -80,16 +80,22 @@ def _mkdir_private(path: Path) -> bool:
         return False
 
 
-def _worker_temp_dir(worker_pid: int) -> Path:
+def _worker_temp_dir(worker_pid: int, lane: str = "") -> Path:
     """Return a per-worker temp subdir named by PID.
 
     v3: each EncoderWorker gets its own subdir under the shared app temp
     dir, so the final cleanup sweep can safely nuke only this worker's
     intermediates without affecting a concurrent worker. The subdir is
     also created with mode=0o700 (FIO09-C).
+
+    v4.7.0: *lane* suffixes the dir ("gpu"/"cpu") for the hybrid
+    scheduler's concurrent lanes — both run in the SAME process, so the
+    PID alone no longer separates them, and a lane finishing early must
+    not sweep the other lane's intermediates out from under it.
     """
     base = _get_app_temp_dir()
-    sub = base / f"worker-{worker_pid}"
+    name = f"worker-{worker_pid}" + (f"-{lane}" if lane else "")
+    sub = base / name
     _mkdir_private(sub)
     return sub
 

@@ -250,4 +250,5 @@ class TestEntryPoints:
             capture_output=True, text=True, timeout=10,
         )
         assert result.returncode == 0
-        assert "4.5.0" in result.stdout
+        import opentranscode
+        assert opentranscode.__version__ in result.stdout

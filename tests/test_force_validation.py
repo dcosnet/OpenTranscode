@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import capture_signal
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,7 +173,9 @@ class TestSkipInvalidFiles:
         worker.env.ffprobe_path = shutil.which("ffprobe") or "/usr/bin/ffprobe"
         logs = []
         worker.log_msg = MagicMock()
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = capture_signal(logs)
+        # v4.2.1+: file-type diagnostics on SKIP are verbose-only.
+        worker.verbose = True
 
         skip, info, src_w, src_h = worker._validate_file(fake_video)
 
@@ -202,7 +205,7 @@ class TestSkipInvalidFiles:
         worker.env.ffprobe_path = shutil.which("ffprobe") or "/usr/bin/ffprobe"
         logs = []
         worker.log_msg = MagicMock()
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = capture_signal(logs)
 
         skip, info, src_w, src_h = worker._validate_file(fake_video)
 
@@ -330,7 +333,7 @@ class TestPreFlightValidation:
         )
 
         logs = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = capture_signal(logs)
 
         # Run the worker — should abort in pre-flight validation
         worker.run()

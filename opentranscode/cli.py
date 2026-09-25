@@ -183,6 +183,41 @@ def build_parser() -> argparse.ArgumentParser:
              "older av1an/VapourSynth builds. Enable for large files "
              "with scaling to save disk + an extra encode pass.",
     )
+    # v4.6.0: --engine selects the video encode engine. "auto" (default)
+    # uses the NVENC hardware encoder for the selected codec family when
+    # the environment probe's live encode test proved it works; "gpu"
+    # forces NVENC (falls back to CPU with a log line); "cpu" forces the
+    # software encoders. The GPU path runs via single-pass ffmpeg —
+    # av1an cannot drive NVENC.
+    parser.add_argument(
+        "--engine", choices=["auto", "gpu", "cpu", "hybrid"], default="auto",
+        help="Video encode engine (default: auto). 'auto' uses the NVENC "
+             "GPU encoder (hevc_nvenc / av1_nvenc) when the selected "
+             "codec family has one and a live encode test proved it "
+             "works; falls back to CPU otherwise. 'gpu' forces NVENC. "
+             "'cpu' forces the software encoders (SVT-AV1 / VP9 / "
+             "x265). 'hybrid' splits the queue between a GPU lane and a "
+             "CPU lane running CONCURRENTLY (balanced by file size, CPU "
+             "lane budget reduced by the GPU lane's reserve) — with "
+             "--use-av1an the CPU lane uses chunk-parallel, so NVENC + "
+             "chunk workers + software all run at once. Needs 2+ "
+             "encodable files and a functional GPU encoder; falls back "
+             "to CPU otherwise. GPU encodes run via single-pass ffmpeg "
+             "— av1an never drives NVENC.",
+    )
+    # v4.8.0: force a GPU capability profile (see gpu_profiles.py for
+    # the combined generation entries). "auto" matches the detected card.
+    from .gpu_profiles import GPU_PROFILES
+    parser.add_argument(
+        "--gpu-profile", default="auto",
+        choices=["auto"] + [gp.key for gp in GPU_PROFILES],
+        help="GPU capability profile (default: auto-detect from the "
+             "installed card). Combined generation entries — e.g. "
+             "nv-pascal covers the whole GTX 10-series + Tesla P40/P4/"
+             "P100; nv-ada covers RTX 40/50. Forcing a profile extends "
+             "the rebuild-from-git dependency tree with that GPU's "
+             "packages. 'cpu' = ignore hardware.",
+    )
     return parser
 
 
@@ -242,6 +277,22 @@ def run_dry_run(
               f"phone-recorded MP4s)")
     effective_cm = env.av1an_flags.get("chunk_method_override")
     print(f"Chunk method:  {effective_cm or 'auto (av1an decides)'}{cli_chunk_method_note}")
+
+    # v4.6.0: GPU/NVENC probe result (live encode test, not just the
+    # compiled-in encoder list).
+    gpu = getattr(env, "gpu", None)
+    if gpu is None:
+        print("GPU:           (probe unavailable)")
+    elif gpu.has_gpu:
+        print(f"GPU:           {gpu.name or 'NVIDIA'} — NVENC ready: "
+              f"{', '.join(gpu.usable_encoders)}")
+    elif any(gpu.encoders.values()):
+        present = [e for e in ("av1_nvenc", "hevc_nvenc", "h264_nvenc")
+                   if gpu.encoders.get(e)]
+        print(f"GPU:           {', '.join(present)} present but NOT usable — "
+              f"{gpu.first_failure_detail or 'smoke test failed'}")
+    else:
+        print("GPU:           none (CPU encoding)")
 
     # v4.1.0: show intelligent worker math so the user can verify the
     # chunk-parallel thread budget before launching a real encode.
@@ -380,4 +431,6 @@ def main(argv: list[str] | None = None) -> int:
         skip_existing=args.skip_existing,
         timeout=args.timeout,
         inline_scale=args.inline_scale,
+        engine=args.engine,
+        gpu_profile=args.gpu_profile,
     )

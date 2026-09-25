@@ -7,7 +7,7 @@ the CLI --version path).
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # ──────────────────────────────────────────────
 #  CONFIG-DRIVEN PROFILES (replaces all if/else chains)
@@ -36,6 +36,25 @@ class VideoCodecProfile:
     # output for each encoder; this is the codec_name field in the video
     # stream's JSON, NOT the encoder_name (which would be "libsvtav1" etc).
     ffprobe_codec_name: str = ""
+    # v4.6.0: hardware (NVENC) counterpart for this codec family. Empty
+    # string = no hardware encoder exists for this family (VP9 has no
+    # NVENC encoder). The GPU path is ffmpeg-only (av1an cannot drive
+    # NVENC); EncoderWorker.resolve_gpu_encoder() only selects it when a
+    # functional probe proved the encoder works on this system. The
+    # ffprobe codec_name is IDENTICAL to the CPU encoder's (hevc_nvenc
+    # also produces "hevc"), so skip-existing detection works across
+    # GPU/CPU re-encodes of the same family.
+    gpu_encoder: str = ""
+    # (crf, preset) -> ffmpeg args for the NVENC encoder. Mirrors
+    # ffmpeg_vargs_fn. None when gpu_encoder is empty.
+    gpu_vargs_fn: Callable[[int, int], list[str]] | None = None
+    # v4.8.0: GPU-profile support. *gpu_family* is the codec family key
+    # used by GpuProfile.encoders ("av1"/"hevc"/"vp9"); *gpu_encoders_by_api*
+    # maps a hardware API (nvenc/vaapi/qsv) to this profile's ffmpeg
+    # encoder for that API. resolve_gpu_encoder() picks the entry matching
+    # the selected GPU profile.
+    gpu_family: str = ""
+    gpu_encoders_by_api: dict[str, str] = field(default_factory=dict)
 
 @dataclass
 class AudioProfile:
@@ -125,6 +144,52 @@ def _x265_ffmpeg_args(crf: int, preset: int) -> list[str]:
             "-pix_fmt", "yuv420p10le", "-g", "240"]
 
 
+# ── v4.6.0: NVENC (hardware) vargs ──
+# NVENC quality control: -rc vbr + -cq N + -b:v 0 is the constant-quality
+# mode that maps most closely to the CPU encoders' CRF (cq ≈ crf for HEVC
+# and AV1 within ~±3). -b:v 0 removes the default bitrate cap so -cq
+# actually governs quality. Presets are p1 (fastest) .. p7 (slowest/best)
+# on all current NVENC generations; the legacy "slow/medium/fast" aliases
+# are deprecated.
+#
+# Pixel format: 8-bit yuv420p. Pascal-generation cards (GTX 10xx) run
+# HEVC Main10 at roughly half throughput, and the archival targets here
+# are 8-bit phone/BluRay sources — 8-bit keeps the GPU path at full
+# speed. ffmpeg auto-converts 10-bit sources to yuv420p.
+
+def _nvenc_preset(preset: int) -> str:
+    """Map the CPU preset tiers (lower value = slower/better) to NVENC
+    p-presets. CPU preset values across profiles are 0..10 with 0/5 =
+    slowest quality tiers; NVENC is fast enough that even p7 outruns any
+    CPU encoder, so the whole range compresses to p3..p7."""
+    if preset <= 6:
+        return "p7"   # "Slow" tier → best NVENC quality
+    if preset <= 8:
+        return "p5"   # "Medium" tier
+    return "p4"       # "Fast"/"Faster" tiers
+
+
+def _hevc_nvenc_args(crf: int, preset: int) -> list[str]:
+    """FFmpeg args for hevc_nvenc (x265/HEVC family hardware encoder)."""
+    return ["-c:v", "hevc_nvenc", "-preset", _nvenc_preset(preset),
+            "-tune", "hq", "-rc", "vbr", "-cq", str(crf), "-b:v", "0",
+            "-pix_fmt", "yuv420p", "-g", "240"]
+
+
+def _h264_nvenc_args(crf: int, preset: int) -> list[str]:
+    """FFmpeg args for h264_nvenc (hardware H.264 — compatibility target)."""
+    return ["-c:v", "h264_nvenc", "-preset", _nvenc_preset(preset),
+            "-tune", "hq", "-rc", "vbr", "-cq", str(crf), "-b:v", "0",
+            "-pix_fmt", "yuv420p", "-g", "240"]
+
+
+def _av1_nvenc_args(crf: int, preset: int) -> list[str]:
+    """FFmpeg args for av1_nvenc (AV1 family hardware encoder, RTX 40+)."""
+    return ["-c:v", "av1_nvenc", "-preset", _nvenc_preset(preset),
+            "-tune", "hq", "-rc", "vbr", "-cq", str(crf), "-b:v", "0",
+            "-pix_fmt", "yuv420p", "-g", "240"]
+
+
 VIDEO_CODECS: list[VideoCodecProfile] = [
     VideoCodecProfile(
         label="AV1 (SVT-AV1)",
@@ -138,6 +203,14 @@ VIDEO_CODECS: list[VideoCodecProfile] = [
         presets=["Slow (8)", "Medium (6)", "Fast (4)", "Faster (2)"],
         preset_map={"Slow (8)": 8, "Medium (6)": 6, "Fast (4)": 4, "Faster (2)": 2},
         ffprobe_codec_name="av1",  # v4.3.0: skip-existing detection
+        # v4.6.0: av1_nvenc exists only on RTX 40+ (Ada) cards; on Pascal
+        # (GTX 10xx) the functional probe fails and auto falls back to
+        # the SVT-AV1 CPU encoder.
+        gpu_encoder="av1_nvenc",
+        gpu_vargs_fn=_av1_nvenc_args,
+        gpu_family="av1",
+        gpu_encoders_by_api={"nvenc": "av1_nvenc", "qsv": "av1_qsv",
+                             "vaapi": "av1_vaapi"},
     ),
     VideoCodecProfile(
         label="VP9",
@@ -151,6 +224,10 @@ VIDEO_CODECS: list[VideoCodecProfile] = [
         presets=["Slow (0)", "Medium (2)", "Fast (4)", "Faster (6)"],
         preset_map={"Slow (0)": 0, "Medium (2)": 2, "Fast (4)": 4, "Faster (6)": 6},
         ffprobe_codec_name="vp9",  # v4.3.0: skip-existing detection
+        # v4.8.0: VP9 has no NVENC encoder; VAAPI (AMD/older Intel) can
+        # encode it on some cards.
+        gpu_family="vp9",
+        gpu_encoders_by_api={"vaapi": "vp9_vaapi"},
     ),
     VideoCodecProfile(
         label="x265 (HEVC)",
@@ -164,6 +241,14 @@ VIDEO_CODECS: list[VideoCodecProfile] = [
         presets=["Slow (5)", "Medium (7)", "Fast (9)", "Faster (10)"],
         preset_map={"Slow (5)": 5, "Medium (7)": 7, "Fast (9)": 9, "Faster (10)": 10},
         ffprobe_codec_name="hevc",  # v4.3.0: skip-existing detection
+        # v4.6.0: hevc_nvenc works on every NVENC generation since Maxwell
+        # GM206 (incl. the GTX 1070) — this is the family that benefits
+        # most from GPU mode.
+        gpu_encoder="hevc_nvenc",
+        gpu_vargs_fn=_hevc_nvenc_args,
+        gpu_family="hevc",
+        gpu_encoders_by_api={"nvenc": "hevc_nvenc", "qsv": "hevc_qsv",
+                             "vaapi": "hevc_vaapi"},
     ),
 ]
 
@@ -222,6 +307,23 @@ FFMPEG_LIB_KEY_MAP: dict[str, str] = {
     "libaom-av1": "libaom",
     "libvpx-vp9": "libvpx",
     "libx265":    "libx265",
+    # v4.6.0: hardware encoders. These keys are populated by
+    # _probe_ffmpeg_libs() alongside the software encoders, and — unlike
+    # the compiled-in check — EncoderWorker additionally gates the GPU
+    # path on env.gpu.functional (a real encode smoke test), because a
+    # ffmpeg build can list an NVENC encoder that the installed driver
+    # cannot open (NVENC API version mismatch).
+    "hevc_nvenc": "hevc_nvenc",
+    "h264_nvenc": "h264_nvenc",
+    "av1_nvenc":  "av1_nvenc",
+    # v4.8.0: hardware APIs for AMD (VAAPI) and Intel (QSV) profiles.
+    "hevc_vaapi": "hevc_vaapi",
+    "h264_vaapi": "h264_vaapi",
+    "av1_vaapi":  "av1_vaapi",
+    "vp9_vaapi":  "vp9_vaapi",
+    "hevc_qsv":   "hevc_qsv",
+    "h264_qsv":   "h264_qsv",
+    "av1_qsv":    "av1_qsv",
 }
 
 

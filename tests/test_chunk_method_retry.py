@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import capture_signal
 
 
 OPENTRANSCODE_PATH = Path(__file__).resolve().parent.parent / "open-transcode.py"
@@ -279,7 +280,10 @@ class TestY4mBreakRetry:
         worker._ffmpeg_fallback_encode = MagicMock(return_value=True)
 
         logs: list[str] = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = capture_signal(logs)
+        # v4.2.1+: RETRY log lines are verbose-only; the test asserts on
+        # them, so enable verbose output.
+        worker.verbose = True
 
         # Setup required attributes
         worker._current_temps = []
@@ -379,7 +383,7 @@ class TestY4mBreakRetry:
         worker._ffmpeg_fallback_encode = mock_ffmpeg_fallback
 
         logs: list[str] = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = capture_signal(logs)
         worker._current_temps = []
         worker._stop = False
 
@@ -455,7 +459,7 @@ class TestY4mBreakRetry:
         worker._ffmpeg_fallback_encode = MagicMock(return_value=True)
 
         logs: list[str] = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = capture_signal(logs)
         worker._current_temps = []
         worker._stop = False
 
@@ -490,9 +494,16 @@ class TestVSPluginProbe:
         """When no VS plugin .so files exist in any search dir, the probe
         should return an empty list."""
         # Point HOME at an empty tmp dir so the home-dir search paths
-        # don't accidentally find real plugins
+        # don't accidentally find real plugins. v4.7.1: the probe also
+        # scans the python site-packages plugin dirs — patch those too,
+        # or a machine with a git-built BestSource (user site) would
+        # legitimately report it and break the hermetic expectation.
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+        import opentranscode.env_probe as _ep
+        monkeypatch.setattr(_ep.site, "getusersitepackages",
+                            lambda: str(tmp_path / "site-packages"))
+        monkeypatch.setattr(_ep.site, "getsitepackages", lambda: [])
 
         result = opentranscode_module._probe_vs_source_plugins()
         assert result == [], \

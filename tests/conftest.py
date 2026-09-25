@@ -357,3 +357,28 @@ def make_minimal_worker(opentranscode_module, env=None, audio_level_db=-14.0):
     worker.subtitle_lang = None
     worker.use_ffmpeg_fallback = False
     return worker
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Signal capture helper (PySide6-safe)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def capture_signal(logs: list):
+    """Return a drop-in replacement for a Qt Signal that appends every
+    emit()ed message to *logs*.
+
+    Tests must REPLACE the whole signal object (``worker.log_msg =
+    capture_signal(logs)``) instead of patching ``worker.log_msg.emit``:
+    PySide6's real SignalInstance forbids attribute assignment ("attribute
+    'emit' is read-only"), and whether the real PySide6 is loaded depends
+    on test ordering — so patching .emit works only in some runs. This
+    helper behaves identically under the stub and the real PySide6.
+    """
+    class _CaptureSignal:
+        def connect(self, fn):
+            pass
+
+        def emit(self, msg):
+            logs.append(msg)
+
+    return _CaptureSignal()

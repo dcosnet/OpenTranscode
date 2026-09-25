@@ -38,6 +38,12 @@ from .codec_profiles import (
     VideoCodecProfile,
     ffmpeg_lib_key_for,
 )
+from .gpu_profiles import (
+    encoder_filter_chain,
+    encoder_pre_args,
+    encoder_quality_args,
+    gpu_profile_by_key,
+)
 from .env_probe import EnvProbe, _av1an_env
 from .ffprobe_utils import (
     _identify_file_type,
@@ -52,10 +58,96 @@ from .temp_manager import _temp_path_for, _worker_temp_dir
 #  ENCODER WORKER (QThread, from PySide6 ver, extended)
 # ──────────────────────────────────────────────
 
+def scan_input_files(in_dir: Path, extensions: set[str]) -> list[Path]:
+    """Collect the transcodable files under *in_dir* (v4.7.0).
+
+    Used by ``EncoderWorker.run()`` for the default whole-directory scan
+    AND by the hybrid scheduler's pre-scan, which must partition the
+    queue BEFORE the per-lane workers are constructed. Excludes leftover
+    pre-scale intermediates from previous failed runs.
+    """
+    return sorted(
+        f for f in in_dir.rglob("*")
+        if f.is_file()
+        and f.suffix.lower() in extensions
+        and not f.name.endswith(".scaled_tmp.mkv")
+    )
+
+
+def selected_gpu_profile(env):
+    """v4.8.0: the active GpuProfile — the UI's dropdown selection
+    (env.av1an_flags["gpu_profile"]) when set, else the auto-matched
+    profile from the probe (env.gpu.profile_key). None when neither."""
+    flags = getattr(env, "av1an_flags", None) or {}
+    key = flags.get("gpu_profile")
+    if key and key != "auto":
+        profile = gpu_profile_by_key(key)
+        if profile is not None:
+            return profile
+    gpu_info = getattr(env, "gpu", None)
+    if gpu_info is not None and getattr(gpu_info, "profile_key", ""):
+        return gpu_profile_by_key(gpu_info.profile_key)
+    return None
+
+
+def resolve_gpu_encoder(engine: str, video_codec, env):
+    """Decide whether this encode runs on the GPU.
+
+    Returns ``(encoder_name, api)`` when the GPU path should be used —
+    e.g. ``("hevc_nvenc", "nvenc")`` or ``("hevc_vaapi", "vaapi")`` — or
+    ``(None, None)`` for the CPU path.
+
+    Rules:
+      - ``engine == "cpu"``              → always CPU (user forced CPU).
+      - selected/matched GPU profile has
+        no encoder for the codec family  → CPU (e.g. AV1 on Pascal,
+                                          VP9 without VAAPI).
+      - ``engine`` auto/gpu AND the
+        functional probe passed for
+        that encoder                     → the encoder.
+
+    The gate is ``env.gpu.functional`` — a live encode test run by the
+    env probe — NOT the compiled-in ``ffmpeg -encoders`` list, because a
+    ffmpeg build can advertise a hardware encoder the installed driver
+    is too old to open. Pure function; no I/O. Safe to call from the UI
+    thread for a pre-flight status line.
+    """
+    if engine not in ("auto", "gpu"):
+        return (None, None)
+    profile = selected_gpu_profile(env)
+    if profile is not None:
+        family = getattr(video_codec, "gpu_family", "") or ""
+        gpu_enc = profile.encoders.get(family)
+        api = profile.api
+    else:
+        # No GPU profile context (older callers / no probe data): fall
+        # back to the profile's NVENC encoder.
+        gpu_enc = getattr(video_codec, "gpu_encoder", "") or ""
+        api = "nvenc" if gpu_enc else None
+    if not gpu_enc:
+        return (None, None)
+    gpu_info = getattr(env, "gpu", None)
+    if gpu_info is not None and gpu_info.functional.get(gpu_enc, False):
+        return (gpu_enc, api)
+    return (None, None)
+
+
 class EncoderWorker(QThread):
     log_msg       = Signal(str)
     progress_msg  = Signal(str, int, int)   # (filename, current, total)
     finished_queue = Signal(int, int)        # (success_count, fail_count)
+
+    # v4.4.3/v4.6.0: class-level defaults for attributes normally set in
+    # __init__. The mocked test suite builds workers via ``__new__``
+    # (bypassing __init__) and calls non-Qt methods directly; without
+    # these defaults those instances crash with AttributeError on
+    # ``verbose`` / ``_current_total`` (the "AttributeError: no attribute
+    # 'verbose'" class of bugs from the v4.4.3 changelog). Instance
+    # assignment in __init__ shadows these harmlessly.
+    verbose = False
+    _current_idx = 0
+    _current_total = 0
+    _current_filename = ""
 
     def __init__(
         self,
@@ -87,6 +179,25 @@ class EncoderWorker(QThread):
         # to honor them.
         max_workers: int | None = None,
         threads_per_worker: int | None = None,
+        # v4.6.0: encode engine selection. "auto" uses the NVENC GPU
+        # encoder when the selected codec family has one AND the env
+        # probe's live encode test proved it works on this system;
+        # otherwise (or with "cpu") the CPU encoders are used. "gpu"
+        # requests GPU and falls back to CPU with a log line when the
+        # hardware is unavailable. Resolved against env.av1an_flags
+        # ["engine"] like the other CLI-plumbed flags.
+        engine: str | None = None,
+        # v4.7.0: hybrid-lane support. *file_subset* restricts this
+        # worker to an explicit file list (the hybrid scheduler scans and
+        # partitions the queue up front, then spawns a GPU-lane and a
+        # CPU-lane worker with disjoint subsets). *lane* suffixes the
+        # per-worker temp dir so one lane's cleanup sweep can never
+        # delete the other lane's intermediates. *ffmpeg_threads* caps
+        # the CPU lane's software ffmpeg encode (GPU jobs are capped by
+        # NVENC silicon, not threads).
+        file_subset: list[Path] | None = None,
+        lane: str = "",
+        ffmpeg_threads: int | None = None,
     ):
         super().__init__()
         self.in_dir = in_dir
@@ -126,6 +237,23 @@ class EncoderWorker(QThread):
                 ) else None
             )
         )
+        # v4.6.0: engine selection ("auto" | "gpu" | "cpu"). Falls back to
+        # env.av1an_flags["engine"] when not passed explicitly (same
+        # pattern as max_workers — lets the CLI reach the GUI-spawned
+        # worker without ui_window changes). Resolved to a concrete
+        # GPU/CPU decision in run() via resolve_gpu_encoder().
+        self.engine = engine if engine in ("auto", "gpu", "cpu") else (
+            env.av1an_flags.get("engine", "auto")
+            if env.av1an_flags.get("engine") in ("auto", "gpu", "cpu")
+            else "auto"
+        )
+        # Resolved in run(): NVENC encoder name when the GPU path is
+        # active, None for CPU. _ffmpeg_fallback_encode and
+        # _prepare_input read this (GPU mode implies the ffmpeg path —
+        # av1an cannot drive NVENC — which also means no pre-scale
+        # intermediate: the ffmpeg path scales inline).
+        self._gpu_encoder: str | None = None
+        self._gpu_api: str | None = None
         # v4.2.1: quiet mode by default. Tech-detail log lines (CMD:,
         # live tail of av1an/ffmpeg stderr, DIAGNOSIS blocks, resolution
         # map, pre-flight validation table, heartbeat) are gated behind
@@ -183,7 +311,10 @@ class EncoderWorker(QThread):
         # cleanup sweep can safely nuke only this worker's intermediates
         # without affecting a concurrent worker. The subdir is created
         # with mode=0o700 to prevent symlink attacks from other users.
-        self._temp_dir = _worker_temp_dir(os.getpid())
+        self.file_subset = file_subset
+        self.lane = lane
+        self.ffmpeg_threads = ffmpeg_threads
+        self._temp_dir = _worker_temp_dir(os.getpid(), lane=lane)
         # v6-06: KeepAwake instance — started in run(), stopped in finally.
         # mouse_nudge defaults to False (opt-in) to avoid surprising the
         # user with cursor movement. systemd-inhibit is always-on when
@@ -579,7 +710,25 @@ class EncoderWorker(QThread):
         Returns True on success, False on failure.
         """
         # Check if ffmpeg has the video encoder we need
-        ffmpeg_enc = self.video_codec.ffmpeg_encoder
+        # v4.6.0: GPU mode swaps in the hardware encoder and its vargs.
+        # v4.8.0: VAAPI/QSV APIs build their command shape (device init,
+        # hwupload filter, quality args) from gpu_profiles; NVENC keeps
+        # the original profile vargs.
+        ffmpeg_enc = self._gpu_encoder or self.video_codec.ffmpeg_encoder
+        v_args = (
+            (self.video_codec.gpu_vargs_fn or self.video_codec.ffmpeg_vargs_fn)
+            if self._gpu_encoder else self.video_codec.ffmpeg_vargs_fn
+        )(self.crf, self.preset_val)
+        hw_pre_args: list[str] = []
+        hw_filter_args: list[str] = []
+        if self._gpu_encoder and self._gpu_api in ("vaapi", "qsv"):
+            profile = selected_gpu_profile(self.env)
+            if profile is not None:
+                hw_pre_args = encoder_pre_args(profile)
+                hw_filter_args = encoder_filter_chain(profile)
+                v_args = encoder_quality_args(
+                    self._gpu_api, ffmpeg_enc, self.crf, self.preset_val
+                )
         # v3: use the module-level FFMPEG_LIB_KEY_MAP (OTC-007).
         ffmpeg_lib_key = ffmpeg_lib_key_for(ffmpeg_enc)
 
@@ -590,19 +739,29 @@ class EncoderWorker(QThread):
             )
             return False
 
-        v_args = self.video_codec.ffmpeg_vargs_fn(self.crf, self.preset_val)
-
         # Belt-and-suspenders: if a target resolution is set, inject -vf scale
         # directly into the ffmpeg command. This guarantees the output resolution
         # matches the dropdown even if the intermediate pre-scale was bypassed.
         vf_scale_args: list[str] = []
         if self.resolution.width is not None and self.resolution.height is not None:
-            vf_scale_args = [
-                "-vf", (
-                    f"scale={self.resolution.width}:{self.resolution.height}:"
-                    f"force_original_aspect_ratio=decrease:force_divisible_by=2"
-                ),
-            ]
+            if self._gpu_api == "vaapi":
+                # v4.8.0: VAAPI scales ON the hardware — combine the
+                # scalar with the hwupload upload in one chain.
+                vf_scale_args = [
+                    "-vf", (
+                        f"scale={self.resolution.width}:{self.resolution.height}:"
+                        f"force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                        f"format=nv12,hwupload"
+                    ),
+                ]
+                hw_filter_args = []
+            else:
+                vf_scale_args = [
+                    "-vf", (
+                        f"scale={self.resolution.width}:{self.resolution.height}:"
+                        f"force_original_aspect_ratio=decrease:force_divisible_by=2"
+                    ),
+                ]
 
         # Audio args from profile
         audio_args = list(self.audio_profile.params)
@@ -623,10 +782,23 @@ class EncoderWorker(QThread):
         if self.container.ext == "mp4":
             mux_flags = ["-movflags", "+faststart"]
 
-        cmd = [
-            self.env.ffmpeg_path,
+        cmd = [self.env.ffmpeg_path] + hw_pre_args + [
             "-i", str(encode_input),
-        ] + vf_scale_args + v_args + audio_args + mux_flags + [
+        ] + vf_scale_args + hw_filter_args + v_args
+        # v4.7.0: CPU lane thread cap in hybrid mode (the GPU lane's
+        # NVENC job keeps ~2 threads for decode/mux). Never applied on
+        # the GPU path — NVENC throughput is silicon-bound, not
+        # thread-bound. Skipped when the cap is 0/unset.
+        if self._gpu_encoder is None and self.ffmpeg_threads:
+            # v4.7.1: libx265 maps -threads to frame-threads, capped at
+            # X265_MAX_FRAME_THREADS (16) — larger values abort the
+            # encoder ("frameNumThreads must be [0 .. X265_MAX_FRAME_
+            # THREADS)"). SVT-AV1 and libvpx accept the full budget.
+            threads = self.ffmpeg_threads
+            if ffmpeg_enc == "libx265":
+                threads = min(threads, 16)
+            cmd += ["-threads", str(threads)]
+        cmd += audio_args + mux_flags + [
             "-y",
             str(output_f),
         ]
@@ -672,6 +844,11 @@ class EncoderWorker(QThread):
                 self.log_msg.emit(
                     f"  ffmpeg error (rc={res.returncode}): {stderr_snip.strip()}"
                 )
+                # v4.7.1: remove the partial output. Without this, a
+                # failed encode left a truncated file that ffprobe can
+                # still parse as the right codec — and skip-existing
+                # would then treat it as a finished archive forever.
+                output_f.unlink(missing_ok=True)
                 return False
         except OSError as e:
             self.log_msg.emit(f"{self._status_prefix()}FAIL: system error: {e}")
@@ -693,14 +870,44 @@ class EncoderWorker(QThread):
         phys = self.env.cpu.physical_cores
         logical = self.env.cpu.logical_threads
 
+        # ── v4.6.0: engine resolution (GPU vs CPU) ──
+        # GPU mode is a variant of the ffmpeg path: av1an invokes
+        # encoder CLI binaries (SvtAv1EncApp / vpxenc / x265) and cannot
+        # drive NVENC, so an active GPU encoder forces the single-pass
+        # ffmpeg path. NVENC on even a GTX 1070 encodes 1080p at several
+        # hundred fps — one ffmpeg process beats av1an's chunk-parallel
+        # CPU workers, and chunking becomes unnecessary.
+        self._gpu_encoder, self._gpu_api = resolve_gpu_encoder(
+            self.engine, self.video_codec, self.env)
+        if self._gpu_encoder:
+            self.use_ffmpeg_fallback = True
+            self.log_msg.emit(
+                f"ENGINE: GPU ({self._gpu_encoder}, {self._gpu_api}) — "
+                f"single-pass ffmpeg hardware encode; av1an chunk-parallel "
+                f"not used."
+            )
+        elif self.engine == "gpu":
+            gpu_enc = getattr(self.video_codec, "gpu_encoder", "") or ""
+            if not gpu_enc and not getattr(self.video_codec, "gpu_family", ""):
+                self.log_msg.emit(
+                    f"ENGINE: GPU requested but {self.video_codec.label} has no "
+                    f"hardware encoder — using CPU."
+                )
+            else:
+                gpu = getattr(self.env, "gpu", None)
+                detail = gpu.first_failure_detail if gpu is not None else ""
+                self.log_msg.emit(
+                    f"ENGINE: GPU requested but no usable hardware encoder for "
+                    f"{self.video_codec.label} ({detail or 'unavailable'}) — using CPU."
+                )
+
         # Collect all valid files first (for progress tracking)
         # Exclude our own temp intermediates from previous failed runs.
-        all_files = sorted(
-            f for f in self.in_dir.rglob("*")
-            if f.is_file()
-            and f.suffix.lower() in self.extensions
-            and not f.name.endswith(".scaled_tmp.mkv")
-        )
+        if self.file_subset is not None:
+            # v4.7.0: hybrid lane — the scheduler partitioned the queue.
+            all_files = sorted(self.file_subset)
+        else:
+            all_files = scan_input_files(self.in_dir, self.extensions)
         total = len(all_files)
 
         if total == 0:
@@ -713,7 +920,12 @@ class EncoderWorker(QThread):
         # to know the worker math — they just need files to encode.
         # use_ffmpeg_fallback is set by the main thread's pre-flight check.
         if self.verbose:
-            if self.use_ffmpeg_fallback:
+            if self._gpu_encoder:
+                self._vlog(
+                    f"GPU encode: {self.video_codec.label} via "
+                    f"{self._gpu_encoder} (NVENC), CPU decode"
+                )
+            elif self.use_ffmpeg_fallback:
                 self._vlog(
                     f"FFmpeg fallback: {self.video_codec.ffmpeg_encoder} on {phys} cores "
                     f"(single-pass, no chunk-parallel)"
@@ -1188,7 +1400,15 @@ class EncoderWorker(QThread):
         # temp directory so the user's video folders stay clean.
         encode_input = file_path
 
-        if needs_scale and not self.inline_scale:
+        # v4.6.0: pre-scale ONLY on the av1an path. The pure-ffmpeg path
+        # (the default, and the only path NVENC can run on) scales inline
+        # via the -vf args in _ffmpeg_fallback_encode — the intermediate
+        # existed solely because VapourSynth source plugins choke on some
+        # inputs ffmpeg handles fine. Skipping it on the ffmpeg path
+        # removes the entire class of large-file failures: no 0.5-0.8x
+        # source-size temp file, no extra full encode pass, and no
+        # pre-scale timeout on long/high-bitrate sources.
+        if needs_scale and not self.inline_scale and not self.use_ffmpeg_fallback:
             try:
                 temp_scaled = _temp_path_for(file_path, ".scaled_tmp.mkv", worker_dir=self._temp_dir)
                 self._current_temps.append(temp_scaled)
@@ -1217,19 +1437,41 @@ class EncoderWorker(QThread):
                 ]
                 # v4.2.1: Scaling notice is verbose-only.
                 self._vlog(f"  Scaling {src_w or '?'}x{src_h or '?'} -> {self.resolution.width}x{self.resolution.height}...")
-                scale_res = subprocess.run(
-                    scale_cmd, capture_output=True, text=True, timeout=1800,
+                # v4.6.0: run via _run_with_stop_check with the full
+                # per-file timeout. The old flat
+                # subprocess.run(timeout=1800) killed pre-scaling of
+                # long/high-bitrate sources at exactly 30 minutes
+                # ("FAIL: pre-scale error: Command ... timed out") — a
+                # guaranteed large-file failure that also ignored the
+                # STOP button for the whole intermediate pass.
+                scale_status, scale_rc, _s_out, scale_err = self._run_with_stop_check(
+                    scale_cmd, timeout=self.encode_timeout, log_prefix="  ",
                 )
-                if scale_res.returncode == 0 and temp_scaled.exists():
+                if scale_status == "stop":
+                    # User aborted — clean up the partial intermediate and
+                    # bail WITHOUT counting a failure (a STOP is not an
+                    # encode failure; the queue loop breaks next iteration).
+                    self._cleanup_current_temps()
+                    return None
+                if scale_status == "timeout":
+                    self.log_msg.emit(
+                        f"{self._status_prefix()}FAIL: pre-scale timeout "
+                        f"(exceeded {self.encode_timeout}s limit)"
+                    )
+                    temp_scaled.unlink(missing_ok=True)
+                    self._cleanup_current_temps()
+                    self.fail_count += 1
+                    return None
+                if scale_status == "ok" and scale_rc == 0 and temp_scaled.exists():
                     encode_input = temp_scaled
                     scaled_size = temp_scaled.stat().st_size / 1_048_576
                     # v4.2.1: verbose-only
                     self._vlog(f"  Pre-scale OK ({scaled_size:.1f} MB intermediate)")
                 else:
-                    stderr_snip = (scale_res.stderr or "")[-200:]
+                    stderr_snip = (scale_err or "")[-200:]
                     # v4.2.1: keep user-facing FAIL but shorten; stderr verbose-only
                     self.log_msg.emit(
-                        f"{self._status_prefix()}FAIL: pre-scale failed (rc={scale_res.returncode})"
+                        f"{self._status_prefix()}FAIL: pre-scale failed (rc={scale_rc})"
                     )
                     if stderr_snip.strip():
                         self._vlog(f"  ffmpeg stderr: {stderr_snip.strip()}")
@@ -1280,15 +1522,17 @@ class EncoderWorker(QThread):
         return (encode_input, output_f)
 
     def _check_disk_space(self, file_path: Path, output_f: Path, needs_scale: bool) -> None:
-        """v4.4.0: Warn (not abort) if free disk space is less than the source size.
+        """v4.4.0: Warn if free disk space is less than the encode will need.
 
-        v4.4.1: warnings gated behind --verbose. The user wants just
-        start + finish lines, no disk-space chatter. The check still
-        runs (so the warning is available via --verbose), but in quiet
-        mode it produces zero output.
+        v4.6.0: SEVERE warnings (free space below the source size on the
+        partition we're about to write a big intermediate/output to) are
+        now USER-FACING — they were verbose-only, so in the default quiet
+        mode a batch that was going to die with "No space left on device"
+        partway through gave zero advance notice. That silent failure was
+        one of the "large files just fail" reports: small files fit in
+        the remaining space, big ones didn't. Marginal advice (the 2-3x
+        intermediate estimate) stays verbose-only.
         """
-        if not self.verbose:
-            return  # v4.4.1: quiet mode — no disk-space warnings
         try:
             src_size = file_path.stat().st_size
         except OSError:
@@ -1296,7 +1540,9 @@ class EncoderWorker(QThread):
         if src_size < 1_073_741_824:  # < 1 GB — skip check for small files
             return
         src_gb = src_size / 1_073_741_824
-        # Check output partition.
+        # Check output partition — severe when free < source size
+        # (the encoded output is usually smaller, but the ffmpeg/av1an
+        # buffer cache plus a same-partition temp can eat the difference).
         try:
             out_usage = shutil.disk_usage(output_f.parent)
             out_free_gb = out_usage.free / 1_073_741_824
@@ -1305,19 +1551,31 @@ class EncoderWorker(QThread):
                     f"  WARN: low disk space on output ({out_free_gb:.1f} GB free, "
                     f"source is {src_gb:.1f} GB) — encode may fail partway through"
                 )
+            elif self.verbose and out_free_gb < src_gb * 2:
+                self._vlog(
+                    f"  WARN: output space getting tight ({out_free_gb:.1f} GB free, "
+                    f"source is {src_gb:.1f} GB)"
+                )
         except OSError:
             pass  # can't check — skip
-        # When scaling, also check the temp partition (lossless intermediate
-        # can be 2-3x source size).
-        if needs_scale:
+        # When scaling on the av1an path, also check the temp partition
+        # (the CRF-16 intermediate can be ~1x source size). The ffmpeg
+        # path scales inline (no intermediate), so no temp warning there.
+        if needs_scale and not self.use_ffmpeg_fallback:
             try:
                 tmp_usage = shutil.disk_usage(self._temp_dir)
                 tmp_free_gb = tmp_usage.free / 1_073_741_824
-                # Lossless intermediate is typically 2-3x source; warn if
-                # free < source * 2.
-                if tmp_free_gb < src_gb * 2:
+                # Severe: free temp space below the source size means the
+                # intermediate will likely not fit → user-facing warning.
+                if tmp_free_gb < src_gb:
                     self.log_msg.emit(
                         f"  WARN: low disk space on temp ({tmp_free_gb:.1f} GB free, "
+                        f"source is {src_gb:.1f} GB) — the scale intermediate "
+                        f"may not fit. Free space or enable 'Inline scale'."
+                    )
+                elif self.verbose and tmp_free_gb < src_gb * 2:
+                    self._vlog(
+                        f"  WARN: temp space getting tight ({tmp_free_gb:.1f} GB free, "
                         f"lossless intermediate may need ~{src_gb * 2:.1f} GB) — "
                         f"consider scaling to a smaller resolution or freeing space"
                     )
@@ -1550,6 +1808,12 @@ class EncoderWorker(QThread):
                     return False
             else:
                 stderr_full = res.stderr or ""
+                # v4.6.0: scan stdout too. av1an routes chunk-retry
+                # noise (encoder stderr dumps, FRAME MISMATCH lines)
+                # to stdout, so pattern-matching on stderr alone missed
+                # the biggest real-world failure mode (see the FRAME
+                # MISMATCH pattern below).
+                combined_out = stderr_full + "\n" + (res.stdout or "")
                 # v6: Don't increment fail_count yet — we may retry with
                 # ffmpeg fallback below. Only increment if the retry also
                 # fails (or no retry is possible).
@@ -1685,10 +1949,56 @@ class EncoderWorker(QThread):
                         ),
                         False,  # don't stop queue — retry with select chunk method
                     ),
+                    # v4.6.0: ffmpeg ≥ 7 removed the -vsync option that
+                    # av1an's segment/hybrid chunk extraction passes to
+                    # ffmpeg. Every segment-based chunk dies immediately
+                    # ("Unrecognized option 'vsync'." → empty y4m pipe →
+                    # chunk fails 3x). Verified on ffmpeg 9.0.2 + av1an
+                    # 0.5.2. select (or a VS source plugin method) is the
+                    # only working chunking on these systems.
+                    (
+                        "Unrecognized option 'vsync'",
+                        "av1an's segment/hybrid chunk extraction calls "
+                        "`ffmpeg -vsync`, which ffmpeg 7+ removed. Every "
+                        "segment-based chunk fails instantly on this system.",
+                        (
+                            "  FIX: install a VapourSynth source plugin so av1an",
+                            "  stops using ffmpeg segmenting: bestsource/ffms2/",
+                            "  lsmash (e.g. on Arch: vapoursynth-plugin-bs).",
+                            "  Alternatively stay on the default ffmpeg-only path",
+                            "  (it doesn't use av1an chunking at all).",
+                        ),
+                        False,  # per-file — the select override keeps other files working
+                    ),
+                    # v4.6.0: frame-count drift between av1an's chunk
+                    # manifest and what the encoder actually produced.
+                    # av1an retries the chunk 3x, then shuts the worker
+                    # down with the baffling "encoder crashed: exit
+                    # status: 0" (exit 0 because the encode itself
+                    # succeeded — on partial data). This was the dominant
+                    # large-file failure in the 2026-07-13 av1an log and
+                    # previously fell through to "Unknown av1an failure".
+                    (
+                        "FRAME MISMATCH",
+                        "av1an's chunk manifest expected a different frame count "
+                        "than the encoder produced — chunk-extraction drift on "
+                        "sources with sparse/irregular keyframes. The encode "
+                        "itself exits 0 (it ran on partial data), which av1an "
+                        "reports as 'encoder crashed: exit status: 0'.",
+                        (
+                            "  Will retry with --chunk-method select, which",
+                            "  extracts exact frame ranges and cannot drift.",
+                            "  This is per-file, not systematic — subsequent",
+                            "  files use select automatically.",
+                        ),
+                        False,  # don't stop queue — retry with select chunk method
+                    ),
                 )
                 diagnosis_emitted = False
                 for marker, summary, fixes, stop_queue in error_patterns:
-                    if marker.lower() in stderr_full.lower():
+                    # v4.6.0: scan stdout + stderr (FRAME MISMATCH and
+                    # encoder dumps land in stdout).
+                    if marker.lower() in combined_out.lower():
                         # v4.2.1: DIAGNOSIS block is verbose-only. The user
                         # already saw "FAIL: av1an exit code N" above — they
                         # don't need the multi-line root-cause analysis unless
@@ -1744,7 +2054,8 @@ class EncoderWorker(QThread):
                     # v4.2.1: all DIAGNOSIS verbose-only.
                     if ("SUMMARY" in stderr_full
                             and "Average Speed" in stderr_full
-                            and "Failed to read y4m frame delimiter" not in stderr_full):
+                            and "Failed to read y4m frame delimiter" not in combined_out
+                            and "FRAME MISMATCH" not in combined_out):
                         self._vlog("")
                         self._vlog(
                             "DIAGNOSIS: SVT-AV1 encoder completed successfully (SUMMARY"
@@ -1781,14 +2092,27 @@ class EncoderWorker(QThread):
                 # same params). Cache the working method so subsequent files
                 # skip the wasted first attempt.
                 #
+                # v4.6.0: FRAME MISMATCH (chunk-extraction drift, see the
+                # error-pattern table) joins the y4m break as a drift
+                # symptom that select fixes — it was previously an
+                # "Unknown av1an failure" that went straight to the slow
+                # full-file ffmpeg fallback.
+                #
                 # NOTE: Do NOT clean up _current_temps before the retry —
                 # encode_input (symlink or pre-scaled file) is in
                 # _current_temps and the recursive _encode_one call needs it.
                 # The finally block below will clean up everything after the
                 # recursive call returns (its own finally clears the list
                 # first; our finally then runs on an empty list — no-op).
-                y4m_break = "Failed to read y4m frame delimiter" in stderr_full
-                if (not self._stop and y4m_break
+                extraction_drift = (
+                    "Failed to read y4m frame delimiter" in combined_out
+                    or "FRAME MISMATCH" in combined_out
+                    # ffmpeg >= 7 removed -vsync: segment/hybrid chunking
+                    # dies instantly while select still works (it uses the
+                    # ffmpeg frame server, not segmenting).
+                    or "Unrecognized option 'vsync'" in combined_out
+                )
+                if (not self._stop and extraction_drift
                         and effective_chunk_method != "select"
                         and self.env.av1an_flags.get("has_chunk_method", True)):
                     # v4.2.1: RETRY messages are verbose-only — the user
@@ -2040,9 +2364,15 @@ class EncoderWorker(QThread):
 
         try:
             # Pass 1: analyze current loudness
+            # v4.6.0: -vn skips video decoding — without it the analysis
+            # decoded the ENTIRE video stream just to measure audio
+            # loudness, which pushed long/large files past the 120s
+            # timeout and silently degraded every big file to the static
+            # knob gain.
             analysis_cmd = [
                 self.env.ffmpeg_path,
                 "-i", str(file_path),
+                "-vn",
                 "-af", (
                     f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11:"
                     f"print_format=json"

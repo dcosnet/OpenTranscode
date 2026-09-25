@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import capture_signal
 
 
 OPENTRANSCODE_PATH = Path(__file__).resolve().parent.parent / "open-transcode.py"
@@ -211,7 +212,7 @@ class TestPerFileFallbackRetry:
         worker._ffmpeg_fallback_encode = mock_ffmpeg_fallback
 
         logs = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = capture_signal(logs)
 
         # Set up _current_temps and _file_res_map (needed by _process_one_file)
         worker._current_temps = []
@@ -293,7 +294,7 @@ class TestPerFileFallbackRetry:
         worker._ffmpeg_fallback_encode = MagicMock(return_value=True)
 
         logs = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = capture_signal(logs)
         worker._current_temps = []
         worker._stop = False
 
@@ -356,7 +357,7 @@ class TestPerFileFallbackRetry:
         worker._ffmpeg_fallback_encode = MagicMock(return_value=True)
 
         logs = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = capture_signal(logs)
         worker._current_temps = []
         worker._stop = False  # will be set by the pattern matcher
 

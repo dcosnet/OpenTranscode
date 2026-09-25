@@ -2,6 +2,222 @@
 
 All notable changes to OpenTranscode. Versions follow semantic versioning.
 
+## [4.8.1] — 2026-09-25
+
+### Changed — GPU dropdown / ENGINE interaction
+- **ENGINE = CPU now disables the GPU dropdown** (greyed out with an
+  explanatory tooltip) — the choice would have no effect there.
+- **"None (CPU-only encode)" remains an explicit option** in the GPU
+  dropdown for the opposite case: a GPU present in the box that the
+  user doesn't want encoding on (e.g. it's the display card). The two
+  controls can no longer contradict each other: GPU engines + "None"
+  resolve to the CPU path by design, and CPU engine ignores the GPU
+  choice entirely.
+
+## [4.8.0] — 2026-09-25
+
+### Added — GPU capability profiles (combined generations, incl. oddballs)
+- **New `gpu_profiles.py` + GPU dropdown** (UI, next to ENGINE; CLI
+  `--gpu-profile`). Entries combine whole card generations into single
+  capability classes — same silicon, same encoding behaviour:
+  - NVIDIA Kepler/Maxwell (H.264 only), Pascal (GTX 10-series + Tesla
+    P40/P4/P100 — H.264+HEVC 8/10-bit), Turing (RTX 20 / GTX 16 /
+    Tesla T4 / **CMP 30/40/50HX** — +B-frames), Ampere (RTX 30 /
+    A10/A40 / **CMP 90HX** — no AV1 encode), Ada/Blackwell (RTX 40/50,
+    L4/L40 — +AV1 10-bit).
+  - Oddballs: **NVIDIA data-center compute (V100/A100/H100, CMP
+    170HX) has NO NVENC silicon** — the profile routes to CPU instead
+    of failing. CMP 170HX is GA100-based: the fastest mining card that
+    cannot hardware-encode.
+  - Intel Arc (QSV: H.264+HEVC+AV1) and Iris/UHD; AMD RDNA 3 (VAAPI:
+    +AV1 encode), RDNA 1/2, and the crypto-era GCN 4/5 + Vega cards.
+- **Auto-detection**: the probe matches the detected GPU name
+  (nvidia-smi / lspci, vendor-aware) to a profile; the live encode
+  smoke test decides what actually works. VAAPI encodes via
+  `-vaapi_device` + `hwupload`, QSV via `-init_hw_device qsv=hw`.
+- **Profile-driven encoding**: `resolve_gpu_encoder()` now returns
+  (encoder, api) and the ffmpeg command is built per API (device init
+  args, hwupload filter chains, per-API quality args — nvenc
+  `-rc vbr -cq`, QSV `-global_quality`, VAAPI `-rc_mode CQP`).
+- **Rebuild-from-git builds for the selected GPU profile**: the dep
+  tree extends with the vendor's packages (arch: nv-codec-headers /
+  libva+libdrm+mesa / intel-media-driver+onevpl; debian/redhat/suse
+  equivalents), so pressing REBUILD on a bare system generates the GPU
+  dependency tree too.
+- Forced profiles let a user pin a capability class even when name
+  auto-match fails; "Auto-detect" stays the default.
+
+## [4.7.1] — 2026-09-25
+
+### Added — always-usable REBUILD FROM GIT (self-generating dep tree)
+- **The REBUILD FROM GIT button is now ALWAYS enabled.** It no longer
+  depends on a successful environment probe — a failed probe (missing
+  binaries, broken VSScript, missing av1an) is exactly when the rebuild
+  is needed, so the button works from first launch on a bare system.
+- **The build generates its own dependency tree.** Instead of the old
+  pacman-only toolchain list, `build_dep_plan()` maps the detected distro
+  family to the right package set and installer: arch (pacman), debian
+  (apt-get), redhat (dnf), suse (zypper) — including the previously
+  missing **zimg** (VapourSynth's one hard library dependency, which
+  made the meson step fail on bare systems), meson/ninja/cmake/nasm and
+  rust for av1an. Unsupported families get an explicit manual-install
+  note. Critical tools are re-verified after install; the build aborts
+  with the exact list if anything is still missing.
+- **BestSource plugin now builds from git as part of the VapourSynth
+  rebuild** (cloned with its libp2p submodule, compiled against the
+  freshly installed git-VS headers via PYTHONPATH/PKG_CONFIG_PATH, into
+  the user site-packages plugins dir). This closes the av1an chunking
+  gap: with BestSource present, av1an auto-selects the fast chunk
+  method instead of quadratic-decode `select`. The full chain was
+  verified live on this machine: VS git (Core R80) → BestSource →
+  `av1an --chunk-method bestsource` → rc=0 output.
+- **Runtime env follows the git stack**: `_av1an_env()` and the plugin
+  probe now include the python user-site vapoursynth dir (module + libs
+  + plugins), so av1an loads the freshly built VS instead of the system
+  one after a rebuild.
+
+## [4.7.0] — 2026-09-25
+
+### Added — Hybrid GPU + CPU scheduling
+- **New engine: Hybrid (UI ENGINE combo / `--engine hybrid`).** The
+  queue is scanned once, then split between two CONCURRENT lanes: a GPU
+  lane (NVENC via single-pass ffmpeg) and a CPU lane (the family's
+  software encoder, or av1an chunk-parallel when opted in — so NVENC +
+  chunk workers + software encoders can all run at the same time on
+  multi-core boxes with an NVIDIA card).
+- **LPT load balancing** (`hybrid_scheduler.plan_hybrid`): files sorted
+  by size descending, each assigned to the lane with the lower
+  estimated load using a GPU:CPU speed ratio (default 8:1) — both lanes
+  finish at roughly the same time.
+- **CPU lane thread budget**: the CPU lane's topology is reduced by a
+  2-thread reserve for the GPU lane's decode/scale/mux before the
+  intelligent worker math runs; the lane's software ffmpeg encodes are
+  additionally capped with `-threads N`. NVENC jobs are never
+  thread-capped (silicon-bound).
+- **Per-lane temp dirs** (`worker-<pid>-gpu` / `worker-<pid>-cpu`):
+  both lanes share one process, so the PID alone no longer separates
+  them — a lane finishing early can no longer sweep the other lane's
+  intermediates.
+- STOP stops both lanes; the final summary aggregates both lanes'
+  results. Hybrid needs 2+ encodable files and a functional GPU encoder
+  and otherwise falls back to a single CPU queue with a logged reason.
+  Lanes split FILES, never one file across encoders (mixed-encoder
+  chunks would produce visibly inconsistent quality within a file, and
+  av1an cannot drive NVENC).
+
+### Fixed — during hybrid hardening
+- **libx265 rejects large `-threads` values** ("frameNumThreads must be
+  [0 .. X265_MAX_FRAME_THREADS)"): the CPU lane's injected thread cap is
+  clamped to 16 for libx265; SVT-AV1 and libvpx keep the full budget.
+- **Failed ffmpeg encodes now delete their partial output.** A failed
+  encode used to leave a truncated file that ffprobe still parses as the
+  right codec/resolution — skip-existing would then treat it as a
+  finished archive forever. The output is unlinked on the ffmpeg error
+  path (the av1an and STOP paths already cleaned up).
+
+### Fixed — launcher crash on STARTUP
+- `OpenCodecMaster._build_ui()` read `self.env.av1an_flags` while
+  pre-selecting the ENGINE combo, but `env` is None/absent until
+  `_probe_and_init` runs after the UI build — instantiating the window
+  crashed with `AttributeError: ... has no attribute 'env'` (launcher)
+  or on `NoneType` (package). The pre-select now reads defensively.
+  Verified by offscreen-instantiating the real launcher window.
+
+### Tests
+- `tests/test_hybrid_scheduler.py` (19): LPT split, degenerate cases,
+  thread budget, `file_subset` end-to-end, per-lane temp dirs, ffmpeg
+  thread cap (CPU yes / GPU no), `scan_input_files`, CLI `--engine
+  hybrid`, launcher parity.
+
+## [4.6.0] — 2026-09-25
+
+### Overview
+GPU (NVENC) encoding with auto GPU/CPU engine selection, the root-cause
+fix for the av1an chunking failures on ffmpeg 7+, and the remaining
+large-file failure modes (pre-scale timeout, silent disk exhaustion,
+whole-video loudnorm decode).
+
+### Added — GPU (NVENC) support + auto engine
+- **Engine selector** (UI: Auto/GPU/CPU combo; CLI: `--engine
+  {auto,gpu,cpu}`). Auto uses the NVENC hardware encoder for the
+  selected codec family (x265 → `hevc_nvenc`, AV1 → `av1_nvenc` on
+  RTX 40+) when it actually works; VP9 has no NVENC encoder and stays
+  on CPU. GPU encodes run via single-pass ffmpeg with `-rc vbr -cq N`
+  (CPU decode), so av1an chunk-parallel is not needed — one NVENC
+  process outruns chunk-parallel CPU workers.
+- **`env_probe.GpuInfo` + `_probe_gpu()`**: two-stage NVENC probe —
+  compiled-in encoder list, then a LIVE encode smoke test per encoder.
+  The live gate catches the real-world failure mode where ffmpeg lists
+  `hevc_nvenc` but the installed NVIDIA driver is older than the NVENC
+  API the build targets ("Driver does not support the required nvenc
+  API version. Required: 13.1 Found: 13.0" — observed on GTX 1070 +
+  driver 580 + ffmpeg 9.0.2), reports the driver fix, and the engine
+  falls back to CPU automatically.
+- Skip-existing is engine-agnostic: `hevc_nvenc` outputs the same
+  ffprobe codec_name (`hevc`) as libx265, so switching engines never
+  re-encodes finished files.
+- `--dry-run` prints the GPU verdict (usable encoders or the exact
+  failure detail).
+- **`scripts/build-ffmpeg-nvenc-matched.sh`** — fixes the
+  driver/ffmpeg NVENC API mismatch without touching the system:
+  builds ffmpeg against the nv-codec-headers gen the installed driver
+  actually provides (e.g. 580 driver → gen 13.0) with the distro
+  build's exact feature set, installing to `~/.local` with
+  `--enable-rpath` (critical — without rpath the binary silently
+  loads the distro libavcodec and keeps demanding the newer API).
+  Verified on GTX 1070 + driver 580.178 + ffmpeg 9.0.2: hevc_nvenc
+  and h264_nvenc functional, av1_nvenc correctly reported as
+  unavailable (no Pascal AV1 hardware) and auto stays on SVT-AV1.
+
+### Fixed — av1an chunking (root cause on ffmpeg 7+)
+- **ffmpeg ≥ 7 removed `-vsync`, which av1an's segment/hybrid chunk
+  extraction passes to ffmpeg.** Every segment-based chunk died
+  instantly ("Unrecognized option 'vsync'" → broken y4m pipe → chunk
+  fails 3×) — this produced the y4m pipe-break storm in the 2026-07-13
+  av1an log. Verified end-to-end on ffmpeg 9.0.2 + av1an 0.5.2:
+  `select` still works (it uses the ffmpeg frame server, not
+  segmenting), so the plugin-less `select` override remains, the
+  failure is now diagnosed with an actionable block (install
+  bestsource/ffms2/lsmash, or stay on the ffmpeg-only path), and the
+  select retry now also triggers on it.
+- **FRAME MISMATCH ("encoder crashed: exit status: 0")** — chunk
+  manifest vs encoded frame-count drift on sparse-keyframe sources
+  (20 worker shutdowns in the same log) fell through to "Unknown av1an
+  failure". Now a recognized per-file pattern that retries with
+  `select` (exact frame ranges can't drift). Diagnostics now scan
+  av1an's stdout too, since FRAME MISMATCH lines land there.
+
+### Fixed — large-file failures
+- **The ffmpeg path no longer pre-scales.** The CRF-16 intermediate
+  existed only for VapourSynth source-plugin compatibility; the
+  ffmpeg/GPU path scales inline via `-vf`. This removes the whole
+  class of failures: the 0.5-0.8× source-size temp file, the extra
+  full encode pass, and the flat **1800s pre-scale timeout** that
+  killed long/high-bitrate sources at exactly 30 minutes. The av1an
+  path keeps the intermediate but now runs under the per-file timeout
+  with STOP-button support ("FAIL: pre-scale timeout" on expiry).
+- **Severe disk-space warnings are user-facing.** "free < source size"
+  on the output or temp partition was verbose-only — quiet mode gave
+  zero notice before "No space left on device". Marginal advice stays
+  verbose-only.
+- **Loudnorm analysis is audio-only (`-vn`).** It previously decoded
+  the entire video stream to measure audio loudness, pushing large
+  files past the 120s analysis timeout and silently degrading them to
+  the static knob gain.
+
+### Tests
+- `tests/test_gpu_engine.py` (32): GpuInfo, the live-encode GPU gate
+  (driver-mismatch case included), the resolve matrix, NVENC vargs,
+  CLI `--engine`, worker engine plumbing, launcher parity.
+- `tests/test_large_file_fixes.py` (11): pre-scale gating + timeout +
+  STOP handling, user-facing disk-space warnings, `-vn` loudnorm,
+  FRAME MISMATCH / vsync select retries.
+- Harness: EncoderWorker has class-level defaults for `verbose` /
+  `_current_*` so `__new__`-built test instances match the v4.4.3
+  contract; tests replace the Qt signal with `conftest.capture_signal()`
+  instead of patching read-only `SignalInstance` attributes (fixes all
+  24 order-dependent failures on machines with a real PySide6).
+
 ## [4.5.0] — 2026-07-26 (master)
 
 ### Overview

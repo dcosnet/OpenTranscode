@@ -302,6 +302,8 @@ def test_live_tail_emits_lines(opentranscode_module, mock_env, monkeypatch):
 
     worker = make_minimal_worker(opentranscode_module, env=mock_env)
     worker._stop = False
+    # v4.2.1+: the live stderr/stdout tail only emits when verbose=True.
+    worker.verbose = True
 
     # Patch time.sleep so the poll loop runs instantly.
     monkeypatch.setattr("time.sleep", lambda *a, **k: None)
@@ -359,6 +361,8 @@ def test_live_tail_handles_carriage_return(opentranscode_module, mock_env, monke
 
     worker = make_minimal_worker(opentranscode_module, env=mock_env)
     worker._stop = False
+    # v4.2.1+: the live stderr/stdout tail only emits when verbose=True.
+    worker.verbose = True
 
     monkeypatch.setattr("time.sleep", lambda *a, **k: None)
     monkeypatch.setattr("os.killpg", lambda *a, **k: None)

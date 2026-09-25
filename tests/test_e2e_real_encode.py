@@ -32,6 +32,26 @@ from unittest.mock import MagicMock
 import pytest
 
 
+def _capture_signal(logs: list):
+    """Return a drop-in replacement for a Qt Signal that captures emit()ed
+    messages into *logs*.
+
+    PySide6's SignalInstance attributes are read-only, so tests running
+    against a REAL PySide6 install cannot patch ``worker.log_msg.emit``
+    directly (they can under the conftest stubs). Replacing the whole
+    signal object works in both modes.
+    """
+    class _CaptureSignal:
+        def connect(self, fn):
+            pass
+
+        def emit(self, msg):
+            logs.append(msg)
+
+    return _CaptureSignal()
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Module loading — the open-transcode.py file has a dash in its name, can't use import
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,12 +290,10 @@ class TestRealEncodePipeline:
             subtitle_lang=None,
         )
 
-        # Collect log messages
+        # Collect log messages (replace the signal — SignalInstance
+        # attributes are read-only under a real PySide6 install)
         logs: list[str] = []
-        worker.log_msg.connect = lambda fn: setattr(worker, "_log_fn", fn)
-        # Patch the log_msg signal emit to capture messages
-        original_emit = worker.log_msg.emit
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = _capture_signal(logs)
 
         # Run the worker synchronously (bypass QThread.start)
         worker.run()
@@ -385,7 +403,7 @@ class TestRealEncodePipeline:
         )
 
         logs: list[str] = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = _capture_signal(logs)
 
         worker.run()
 
@@ -458,7 +476,7 @@ class TestRealEncodePipeline:
         )
 
         logs: list[str] = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = _capture_signal(logs)
 
         worker.run()
 
@@ -525,7 +543,7 @@ class TestMovflagsFix:
         )
 
         logs: list[str] = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = _capture_signal(logs)
         worker.run()
 
         # Find the CMD log line — it should contain -movflags +faststart for MP4
@@ -572,7 +590,7 @@ class TestMovflagsFix:
         )
 
         logs: list[str] = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = _capture_signal(logs)
         worker.run()
 
         output_files = list(out_dir.rglob("*_archived.mkv"))
@@ -759,7 +777,10 @@ class TestV7Y4mBreakRecovery:
         worker._ffmpeg_fallback_encode = MagicMock(return_value=True)
 
         logs: list[str] = []
-        worker.log_msg.emit = lambda msg: logs.append(msg)
+        worker.log_msg = _capture_signal(logs)
+        # v4.2.1+: RETRY log lines are verbose-only; the test asserts on
+        # them, so enable verbose output.
+        worker.verbose = True
 
         # Run the full pipeline (not just _encode_one)
         worker.run()

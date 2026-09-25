@@ -16,6 +16,7 @@ import ctypes
 import os
 import re
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,271 @@ from pathlib import Path
 
 from .cpu_topology import CpuTopology, detect_cpu_topology
 from .distro_probe import DistroProfile, detect_distro
+from .gpu_profiles import (
+    encoder_pre_args,
+    encoder_filter_chain,
+    encoder_quality_args,
+    gpu_profile_by_key,
+    match_gpu_profile,
+    resolve_vaapi_device,
+)
+
+# ──────────────────────────────────────────────
+#  GPU PROBE (v4.6.0 — NVENC hardware encoding)
+# ──────────────────────────────────────────────
+
+# NVENC encoders we know how to drive, in preference order (best
+# compression efficiency first). av1_nvenc only exists on RTX 40+; the
+# functional smoke test below decides what is actually usable.
+_NVENC_ENCODER_NAMES: tuple[str, ...] = ("av1_nvenc", "hevc_nvenc", "h264_nvenc")
+
+
+@dataclass
+class GpuInfo:
+    """Result of the GPU/NVENC probe.
+
+    ``encoders``   — encoder name → ffmpeg was BUILT with it (from
+                     ``ffmpeg -encoders``).
+    ``functional`` — encoder name → a real 0.2s NVENC encode SUCCEEDED.
+                     This is the gate EncoderWorker uses: a ffmpeg build
+                     can list hevc_nvenc while the installed driver is
+                     too old for the NVENC API version it was compiled
+                     against ("Driver does not support the required
+                     nvenc API version") — only a live encode reveals
+                     that.
+    ``details``    — encoder name → first stderr line when the smoke
+                     test failed (actionable diagnostics).
+    """
+    name: str = ""                                            # GPU model name via nvidia-smi/lspci, "" if unknown
+    encoders: dict[str, bool] = field(default_factory=dict)
+    functional: dict[str, bool] = field(default_factory=dict)
+    details: dict[str, str] = field(default_factory=dict)
+    # v4.8.0: the matched GpuProfile key from gpu_profiles (auto-detected
+    # from the GPU name; the UI can override it).
+    profile_key: str = ""
+
+    @property
+    def usable_encoders(self) -> list[str]:
+        """Encoders that passed the live encode test, preference order."""
+        return [e for e in _NVENC_ENCODER_NAMES if self.functional.get(e, False)]
+
+    @property
+    def has_gpu(self) -> bool:
+        return bool(self.usable_encoders)
+
+    @property
+    def first_failure_detail(self) -> str:
+        """First non-empty failure detail (for user-facing warnings)."""
+        for e in _NVENC_ENCODER_NAMES:
+            d = self.details.get(e, "")
+            if d:
+                return d
+        return ""
+
+
+def _probe_gpu(ffmpeg_bin: str) -> GpuInfo:
+    """Detect NVIDIA NVENC hardware encoders and verify they actually work.
+
+    Two-stage probe:
+
+      1. Compiled-in check — grep ``ffmpeg -encoders`` for the NVENC
+         encoder names. Cheap; answers "could this ffmpeg ever do NVENC".
+      2. Functional smoke test — for each compiled-in encoder, encode a
+         0.2s 256x264 lavfi color source with ``-c:v <enc> -f null -``.
+         Catches the real-world failure modes the compiled-in check
+         cannot: NVIDIA driver too old for the ffmpeg build's NVENC API
+         version, no /dev/nvidia* access, driver loaded but GPU dead.
+
+    GPU model name is best-effort via nvidia-smi (display only).
+    """
+    info = GpuInfo()
+
+    if not ffmpeg_bin:
+        return info
+
+    # --- Stage 1: compiled-in encoders ---
+    try:
+        res = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        encoders_out = res.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        encoders_out = ""
+
+    for enc in _NVENC_ENCODER_NAMES:
+        info.encoders[enc] = f" {enc} " in encoders_out
+
+    compiled_in = [e for e in _NVENC_ENCODER_NAMES if info.encoders[e]]
+    if not compiled_in:
+        return info  # no hardware encoders in this build — skip stage 2
+
+    # --- GPU model name (display + profile auto-match) ---
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        try:
+            res = subprocess.run(
+                [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                info.name = res.stdout.strip().splitlines()[0].strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not info.name:
+        # No NVIDIA board (or driver down): identify AMD/Intel iGPU/dGPU
+        # from the PCI bus for profile matching + VAAPI/QSV testing.
+        info.name = _probe_pci_gpu_name()
+
+    # --- v4.8.0: capability-class profile for this GPU ---
+    matched = match_gpu_profile(info.name)
+    if matched:
+        info.profile_key = matched.key
+
+        # The profile may claim hardware encoders this ffmpeg build
+        # doesn't even list (e.g. AV1 on an Arc card with an old ffmpeg).
+        for family, enc in matched.encoders.items():
+            if enc not in info.encoders or not info.encoders[enc]:
+                info.encoders[enc] = _ffmpeg_has_encoder(ffmpeg_bin, enc)
+
+        # --- Stage 2 for the profile's hardware API ---
+        if matched.api == "vaapi":
+            info.functional.update(_smoke_vaapi(ffmpeg_bin, matched))
+        elif matched.api == "qsv":
+            info.functional.update(_smoke_qsv(ffmpeg_bin, matched))
+
+    # --- Stage 2: functional smoke test per compiled-in encoder ---
+    for enc in compiled_in:
+        if enc in info.functional:
+            continue  # already smoke-tested via the profile branch
+        try:
+            res = subprocess.run(
+                [
+                    ffmpeg_bin, "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi",
+                    "-i", "color=c=black:s=256x256:d=0.2:r=24",
+                    "-frames:v", "5",
+                    "-c:v", enc, "-f", "null", "-",
+                ],
+                capture_output=True, text=True, timeout=20,
+            )
+            info.functional[enc] = res.returncode == 0
+            if res.returncode != 0:
+                # First stderr line with substance (nvenc errors are
+                # prefixed "hevc_nvenc @ 0x...]" — keep them readable).
+                for line in (res.stderr or "").splitlines():
+                    line = line.strip()
+                    if line:
+                        # Strip the "name @ 0xADDR]" prefix for brevity.
+                        line = re.sub(r"^\[[^]]+@\s*0x[0-9a-f]+\]\s*", "", line)
+                        info.details[enc] = line[:160]
+                        break
+        except subprocess.TimeoutExpired:
+            info.functional[enc] = False
+            info.details[enc] = f"{enc} smoke test timed out after 20s"
+        except (OSError, subprocess.SubprocessError) as e:
+            info.functional[enc] = False
+            info.details[enc] = str(e)[:160]
+
+    return info
+
+
+def _ffmpeg_has_encoder(ffmpeg_bin: str, enc: str) -> bool:
+    """Compiled-in check for one encoder name (cheap -encoders grep)."""
+    try:
+        res = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return f" {enc} " in (res.stdout or "")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _probe_pci_gpu_name() -> str:
+    """Best-effort non-NVIDIA GPU name via lspci (VGA/3D/Display class)."""
+    lspci = shutil.which("lspci")
+    if not lspci:
+        return ""
+    try:
+        res = subprocess.run(
+            [lspci], capture_output=True, text=True, timeout=10,
+        )
+        for line in (res.stdout or "").splitlines():
+            low = line.lower()
+            if any(k in low for k in (" vga ", " 3d ", " display ")):
+                if "nvidia" not in low:  # nvidia handled via nvidia-smi
+                    # "01:00.0 VGA ...: AMD/ATI Navi 31 [Radeon RX 7900 XTX]"
+                    m = re.search(r":\s*(.+)$", line)
+                    return m.group(1).strip() if m else ""
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def _smoke_vaapi(ffmpeg_bin: str, profile) -> dict[str, bool]:
+    """Live-encode VAAPI encoders through the render node. VAAPI
+    encoders only accept hardware surfaces, so the filter chain must
+    upload the lavfi frames."""
+    results: dict[str, bool] = {}
+    dev = resolve_vaapi_device()
+    if not Path(dev).exists():
+        for enc in profile.encoders.values():
+            results[enc] = False
+            details_placeholder = f"no render node ({dev})"
+        return results
+    for enc in profile.encoders.values():
+        try:
+            cmd = (
+                [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
+                + encoder_pre_args(profile, vaapi_device=dev)
+                + ["-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.2:r=24",
+                   "-frames:v", "5"]
+                + encoder_filter_chain(profile)
+                + ["-c:v", enc]
+                + encoder_quality_args(profile.api, enc, 28, 9)
+                + ["-f", "null", "-"]
+            )
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            results[enc] = res.returncode == 0
+            if res.returncode != 0:
+                for line in (res.stderr or "").splitlines():
+                    line = line.strip()
+                    if line:
+                        results[f"_detail_{enc}"] = False  # marker only
+                        break
+        except (OSError, subprocess.SubprocessError):
+            results[enc] = False
+    # Strip the detail markers; keep real encoder results only, and put
+    # first error lines into a readable form for the caller.
+    cleaned: dict[str, bool] = {}
+    for k, v in results.items():
+        if not k.startswith("_detail_"):
+            cleaned[k] = v
+    return cleaned
+
+
+def _smoke_qsv(ffmpeg_bin: str, profile) -> dict[str, bool]:
+    """Live-encode QSV encoders (qsv encoders upload system frames
+    internally once a qsv device exists)."""
+    results: dict[str, bool] = {}
+    for enc in profile.encoders.values():
+        try:
+            cmd = (
+                [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
+                + encoder_pre_args(profile)
+                + ["-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.2:r=24",
+                   "-frames:v", "5",
+                   "-c:v", enc]
+                + encoder_quality_args(profile.api, enc, 28, 9)
+                + ["-f", "null", "-"]
+            )
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            results[enc] = res.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            results[enc] = False
+    return results
+
 
 # ──────────────────────────────────────────────
 #  ENVIRONMENT PROBE (distro-aware, extended)
@@ -52,6 +318,9 @@ class EnvProbe:
     vs_version: str | None = None  # VapourSynth version string (for diagnostics)
     vs_script_lib: str | None = None  # path to libvapoursynth-script.so that passed
     cpu: CpuTopology = field(default_factory=lambda: CpuTopology(1, 1, 1, "Unknown"))
+    # v4.6.0: GPU/NVENC probe result. EncoderWorker reads
+    # env.gpu.functional[encoder_name] when the engine is auto/gpu.
+    gpu: GpuInfo = field(default_factory=GpuInfo)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -141,6 +410,11 @@ def _probe_ffmpeg_libs(ffmpeg_bin: str) -> dict[str, bool]:
         ("libopus",   ["libopus "]),
         ("libvorbis", ["libvorbis "]),
         ("flac",      ["flac "]),
+        # v4.6.0: NVENC hardware encoders (compiled-in check only — the
+        # live-encode gate is _probe_gpu()'s functional dict).
+        ("hevc_nvenc", ["hevc_nvenc "]),
+        ("h264_nvenc", ["h264_nvenc "]),
+        ("av1_nvenc",  ["av1_nvenc "]),
     ]
     libs = {}
     for lib_name, search_strings in checks:
@@ -440,6 +714,36 @@ def probe_environment() -> EnvProbe:
             result.warnings.append(f"FFmpeg version: {result.ffmpeg_version}")
         result.ffmpeg_libs = _probe_ffmpeg_libs(result.ffmpeg_path)
 
+        # v4.6.0: GPU/NVENC probe — compiled-in check + live encode smoke
+        # test. EncoderWorker gates the GPU path on env.gpu.functional;
+        # this warning block surfaces the result (and the fix when the
+        # driver is too old for the ffmpeg build's NVENC API).
+        result.gpu = _probe_gpu(result.ffmpeg_path)
+        gpu = result.gpu
+        if gpu.has_gpu:
+            result.warnings.append(
+                f"GPU: {gpu.name or 'NVIDIA'} — NVENC ready: "
+                f"{', '.join(gpu.usable_encoders)} (engine: Auto will use the GPU)"
+            )
+        elif gpu.encoders and any(gpu.encoders.values()):
+            present = [e for e in _NVENC_ENCODER_NAMES if gpu.encoders.get(e)]
+            detail = gpu.first_failure_detail
+            result.warnings.append(
+                f"GPU: NVENC encoder(s) {', '.join(present)} present in ffmpeg "
+                f"but NOT usable — {detail or 'smoke test failed'}. "
+                f"Auto engine will fall back to CPU."
+            )
+            if "API version" in detail or "minimum required Nvidia driver" in detail:
+                result.warnings.append(
+                    "  FIX: update the NVIDIA driver (the ffmpeg build's NVENC "
+                    "API is newer than the installed driver supports), or use "
+                    "an ffmpeg build matching the installed driver."
+                )
+        else:
+            result.warnings.append(
+                "GPU: no hardware encoder in this ffmpeg build — CPU encoding."
+            )
+
         # Warn about missing AUDIO libs (video codecs are handled by av1an's own
         # encoder binaries — ffmpeg's video encoder list is irrelevant)
         audio_lib_warnings = {
@@ -532,6 +836,31 @@ def probe_environment() -> EnvProbe:
                     "chunk-parallel encoding."
                 )
                 result.av1an_flags["chunk_method_override"] = "select"
+
+            # v4.6.0: ffmpeg ≥ 7 removed the -vsync option that av1an's
+            # segment/hybrid chunk extraction passes to ffmpeg. On those
+            # systems every segment-based chunk dies immediately with
+            # "Unrecognized option 'vsync'." — the y4m pipe breaks and
+            # each chunk fails 3x. The select override above already
+            # avoids those methods when no plugins are installed; this
+            # warning tells plugin-less users on new ffmpeg WHY av1an is
+            # stuck on slow select.
+            if not vs_plugins and result.ffmpeg_version:
+                try:
+                    ffmpeg_major = int(
+                        re.match(r"[nN]?(\d+)", result.ffmpeg_version).group(1)
+                    )
+                except (AttributeError, ValueError):
+                    ffmpeg_major = 0
+                if ffmpeg_major >= 7:
+                    result.warnings.append(
+                        "av1an note: ffmpeg ≥ 7 removed the -vsync option av1an's "
+                        "segment/hybrid chunk methods use — those methods fail "
+                        "with \"Unrecognized option 'vsync'\". Chunking stays on "
+                        "'select'. Install a VapourSynth source plugin "
+                        "(bestsource/ffms2/lsmash) to escape slow select, or use "
+                        "the default ffmpeg-only path."
+                    )
 
         except (OSError, subprocess.SubprocessError) as e:
             result.errors.append(f"av1an probe failed: {e}")
@@ -638,12 +967,29 @@ def _av1an_env() -> dict[str, str]:
     When VapourSynth is built from git and installed to ~/.local/, the linker
     won't find libvapoursynth-script.so unless LD_LIBRARY_PATH points there.
     This function ensures every av1an invocation inherits that path.
+
+    v4.7.1: the git VS stack is self-contained in the python user
+    site-packages (module + libs + BestSource plugin), so the runtime env
+    also gets that dir on LD_LIBRARY_PATH and the user site on PYTHONPATH —
+    otherwise av1an loads the system VS and never sees the fresh stack.
     """
     env = os.environ.copy()
     local_lib = str(Path.home() / ".local" / "lib")
     existing = env.get("LD_LIBRARY_PATH", "")
     if local_lib not in existing:
         env["LD_LIBRARY_PATH"] = f"{local_lib}:{existing}".rstrip(":")
+    try:
+        user_site = Path(site.getusersitepackages())
+        vs_dir = user_site / "vapoursynth"
+        if vs_dir.is_dir() and (vs_dir / "libvsscript.so").exists():
+            existing = env.get("LD_LIBRARY_PATH", "")
+            if str(vs_dir) not in existing:
+                env["LD_LIBRARY_PATH"] = f"{vs_dir}:{existing}".rstrip(":")
+            py_path = env.get("PYTHONPATH", "")
+            if str(user_site) not in py_path:
+                env["PYTHONPATH"] = f"{user_site}:{py_path}".rstrip(":")
+    except (AttributeError, OSError):
+        pass
     return env
 
 
@@ -697,6 +1043,18 @@ def _probe_vs_source_plugins() -> list[str]:
     search_dirs.append(Path("/usr/lib/vapoursynth"))
     search_dirs.append(Path("/usr/local/lib/vapoursynth"))
     search_dirs.append(Path("/usr/lib/x86_64-linux-gnu/vapoursynth"))
+    # v4.7.1: the git-built VapourSynth stack installs its plugins into
+    # the python site-packages tree (module + libs + plugins/ are one
+    # self-contained unit). Probe those dirs too.
+    try:
+        search_dirs.append(Path(site.getusersitepackages()) / "vapoursynth" / "plugins")
+    except (AttributeError, OSError):
+        pass
+    try:
+        for d in site.getsitepackages():
+            search_dirs.append(Path(d) / "vapoursynth" / "plugins")
+    except (AttributeError, OSError):
+        pass
 
     found: set[str] = set()
     for d in search_dirs:
